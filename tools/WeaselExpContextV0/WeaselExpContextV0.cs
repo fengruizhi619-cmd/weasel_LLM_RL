@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Globalization;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -78,10 +79,32 @@ internal static class Program {
   private static IntPtr _hook = IntPtr.Zero;
   private static volatile bool _running = true;
 
+  // [EXP-003 SELF-TEST]
+  private static void SelfTest() {
+    string[] samples = {
+      "核心文本一​",
+      "﻿测试文本",
+      "你好‍世界",
+      "上下文⁠测试"
+    };
+    foreach (string sample in samples) {
+      string clean = RemoveInvisible(sample);
+      Console.WriteLine("raw=" + sample.Length + " clean=" + clean.Length +
+                        " text=[" + clean + "]");
+    }
+    Console.WriteLine("selftest done");
+  }
+
   // [EXP-003 ENTRY]
   [STAThread]
   private static int Main(string[] args) {
     Console.OutputEncoding = Encoding.UTF8;
+    for (int i = 0; i < args.Length; i++) {
+      if (args[i] == "-selftest" || args[i] == "--selftest") {
+        SelfTest();
+        return 0;
+      }
+    }
     ParseArgs(args);
     Console.WriteLine("[exp-v0] cli_emojiless_exp_v0 context reader (hook, no polling)");
     Console.WriteLine("[exp-v0] n=" + _maxChars + " log=" + (_logPath.Length > 0 ? _logPath : "(console only)"));
@@ -136,6 +159,33 @@ internal static class Program {
 
   private static bool IsAsciiLetter(char c) {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+  }
+
+  // [EXP-007 INVISIBLE-CLEAN]
+  // Strip zero-width / format characters an IME or editor may inject into the
+  // document (ZWNJ/ZWJ, zero-width space, BOM/FEFF, word joiner, LTR/RTL
+  // marks, interlinear annotation, etc.) so visible text and its length are
+  // stable across duplicate TextChanged events.
+  private static string RemoveInvisible(string text) {
+    if (string.IsNullOrEmpty(text))
+      return text;
+    var sb = new StringBuilder(text.Length);
+    foreach (char c in text) {
+      if (c == '\u200b' || c == '\u200c' || c == '\u200d' || c == '\u200e' ||
+          c == '\u200f' || c == '\u202a' || c == '\u202b' || c == '\u202c' ||
+          c == '\u202d' || c == '\u202e' || c == '\u2060' || c == '\u2061' ||
+          c == '\u2062' || c == '\u2063' || c == '\u2064' || c == '\u2066' ||
+          c == '\u2067' || c == '\u2068' || c == '\u2069' || c == '\u206a' ||
+          c == '\u206b' || c == '\u206c' || c == '\u206d' || c == '\u206e' ||
+          c == '\u206f' || c == '\ufeff' || c == '\ufff9' || c == '\ufffa' ||
+          c == '\ufffb') {
+        continue;
+      }
+      if (CharUnicodeInfo.GetUnicodeCategory(c) == UnicodeCategory.Format)
+        continue;
+      sb.Append(c);
+    }
+    return sb.ToString();
   }
 
   private static void LogLine(string text) {
@@ -215,6 +265,7 @@ internal static class Program {
 
     string context = ReadContext(element);
     if (context == null) return;
+    context = RemoveInvisible(context);
 
     string trimmed = context;
     if (trimmed.Length > _maxChars) trimmed = trimmed.Substring(trimmed.Length - _maxChars);

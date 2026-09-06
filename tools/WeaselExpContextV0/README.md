@@ -18,3 +18,7 @@ Usage:
 
 All future features follow the same rule: implemented as hooks, never by
 modifying the Weasel core.
+- Invisible-clean: zero-width / Unicode format characters injected by the
+  IME or editor (U+200B/U+200C/U+200D/FEFF/word-joiner/LTR-RTL marks etc.)
+  are stripped before context is logged, so one visible commit yields one
+  stable-length context line.
