@@ -25,3 +25,7 @@ modifying the Weasel core.
 - Console guard: the reader never subscribes to its own console/terminal
   window, otherwise printing logs changes the terminal text and creates a
   self-feedback loop (duplicate lines padded with CR/LF and spaces).
+- Forward-typing gate: only strictly growing contexts are logged (one per
+  committed word); backspace cascades and text+trailing-space duplicates
+  from the same commit are suppressed. Trailing whitespace is trimmed
+  before comparison/logging.
