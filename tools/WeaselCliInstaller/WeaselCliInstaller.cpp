@@ -6,6 +6,8 @@
 
 #include <string>
 #include <vector>
+#include <fstream>
+#include <algorithm>
 
 // [CLI-001 HELPERS]
 static std::wstring ModuleRoot() {
@@ -180,6 +182,8 @@ static void PrintUsage() {
   Print(L"  uninstall - silent uninstall of registered Weasel TSF");
   Print(L"  deploy    - deploy Rime user workspace");
   Print(L"  fix-userdir - force RimeUserDir to %APPDATA%\\Rime");
+  Print(L"  schemas     - list available schemas (shared data dir)");
+  Print(L"  set-schema <schema_id> - write default.custom.yaml with schema first, then deploy");
   Print(L"  status    - print current installation status");
 }
 
@@ -240,11 +244,156 @@ static int DoStatus(const std::wstring& root) {
   return 0;
 }
 
-// [CLI-004 ENTRY]
+// [CLI-004 SCHEMA-CONFIG]
+static std::wstring GetUserDataDir() {
+  HKEY key = nullptr;
+  wchar_t value[MAX_PATH]{};
+  DWORD value_size = sizeof(value);
+  LONG result = RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Rime\\Weasel", 0,
+                              KEY_QUERY_VALUE, &key);
+  if (result == ERROR_SUCCESS) {
+    result = RegQueryValueExW(key, L"RimeUserDir", nullptr, nullptr,
+                              reinterpret_cast<LPBYTE>(value), &value_size);
+    RegCloseKey(key);
+  }
+  if (result == ERROR_SUCCESS && value[0])
+    return std::wstring(value);
+  wchar_t fallback[MAX_PATH]{};
+  if (ExpandEnvironmentStringsW(L"%APPDATA%\\Rime", fallback, MAX_PATH))
+    return std::wstring(fallback);
+  return L"";
+}
+
+static std::wstring GetSharedDataDir() {
+  HKEY key = nullptr;
+  wchar_t value[MAX_PATH]{};
+  DWORD value_size = sizeof(value);
+  LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Rime\\Weasel", 0,
+                              KEY_QUERY_VALUE, &key);
+  if (result == ERROR_SUCCESS) {
+    result = RegQueryValueExW(key, L"WeaselRoot", nullptr, nullptr,
+                              reinterpret_cast<LPBYTE>(value), &value_size);
+    RegCloseKey(key);
+  }
+  if (result == ERROR_SUCCESS && value[0])
+    return std::wstring(value) + L"\\data";
+  return ModuleRoot() + L"\\data";
+}
+
+static std::string WideToUtf8(const std::wstring& w) {
+  if (w.empty())
+    return std::string();
+  int len = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()),
+                                nullptr, 0, nullptr, nullptr);
+  std::string s(static_cast<size_t>(len), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w.c_str(), static_cast<int>(w.size()), &s[0],
+                      len, nullptr, nullptr);
+  return s;
+}
+
+static std::wstring Utf8ToWide(const std::string& u) {
+  if (u.empty())
+    return std::wstring();
+  int len = MultiByteToWideChar(CP_UTF8, 0, u.c_str(), static_cast<int>(u.size()),
+                                nullptr, 0);
+  std::wstring w(static_cast<size_t>(len), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, u.c_str(), static_cast<int>(u.size()), &w[0],
+                      len);
+  return w;
+}
+
+static std::wstring TrimWide(const std::wstring& text) {
+  size_t begin = text.find_first_not_of(L" \t\r\n");
+  if (begin == std::wstring::npos)
+    return L"";
+  size_t end = text.find_last_not_of(L" \t\r\n");
+  return text.substr(begin, end - begin + 1);
+}
+
+static bool SchemaFileExists(const std::wstring& schema_id) {
+  for (const std::wstring& dir : {GetSharedDataDir(), GetUserDataDir()}) {
+    std::wstring path = dir + L"\\" + schema_id + L".schema.yaml";
+    if (GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES)
+      return true;
+  }
+  return false;
+}
+
+static std::vector<std::wstring> BuiltinSchemaOrder(const std::wstring& shared_dir) {
+  std::vector<std::wstring> order;
+  std::ifstream in((shared_dir + L"\\default.yaml").c_str());
+  std::string line;
+  const std::string marker = "- schema:";
+  while (std::getline(in, line)) {
+    size_t pos = line.find(marker);
+    if (pos == std::string::npos)
+      continue;
+    std::wstring id = Utf8ToWide(line.substr(pos + marker.size()));
+    id = TrimWide(id);
+    if (!id.empty())
+      order.push_back(id);
+  }
+  return order;
+}
+
+static void DoListSchemas() {
+  std::wstring shared = GetSharedDataDir();
+  Print(L"[schemas] shared data dir=" + shared);
+  std::vector<std::wstring> ids;
+  WIN32_FIND_DATAW fd{};
+  HANDLE hFind = FindFirstFileW((shared + L"\\*.schema.yaml").c_str(), &fd);
+  if (hFind == INVALID_HANDLE_VALUE) {
+    Print(L"[schemas] (none found)");
+    return;
+  }
+  do {
+    std::wstring name(fd.cFileName);
+    size_t suffix = name.rfind(L".schema.yaml");
+    if (suffix != std::wstring::npos)
+      ids.push_back(name.substr(0, suffix));
+  } while (FindNextFileW(hFind, &fd));
+  FindClose(hFind);
+  std::sort(ids.begin(), ids.end());
+  for (const std::wstring& id : ids)
+    Print(L"  - " + id);
+}
+
+static int DoSetSchema(const std::wstring& schema_id) {
+  if (!SchemaFileExists(schema_id)) {
+    Print(L"[set-schema] schema not found: " + schema_id);
+    return 1;
+  }
+  std::wstring shared = GetSharedDataDir();
+  std::wstring user = GetUserDataDir();
+  if (user.empty()) {
+    Print(L"[set-schema] cannot locate user data dir");
+    return 1;
+  }
+  std::vector<std::wstring> order = BuiltinSchemaOrder(shared);
+  order.erase(std::remove(order.begin(), order.end(), schema_id), order.end());
+  order.insert(order.begin(), schema_id);
+  std::ofstream out((user + L"\\default.custom.yaml").c_str(),
+                    std::ios::trunc | std::ios::binary);
+  out << "patch:\n  schema_list:\n";
+  for (const std::wstring& id : order)
+    out << "    - schema: " << WideToUtf8(id) << "\n";
+  out.close();
+  Print(L"[set-schema] default.custom.yaml updated, first schema=" + schema_id);
+  int deployer = RunFile(ModuleRoot(), L"WeaselDeployer.exe", L"/deploy");
+  if (deployer != 0) {
+    Print(L"[set-schema] deploy failed exit=" + std::to_wstring(deployer));
+    return deployer;
+  }
+  RunFile(ModuleRoot(), L"WeaselServer.exe", L"/q");
+  return StartServer(ModuleRoot());
+}
+
+// [CLI-005 ENTRY]
 int wmain() {
   int argc = 0;
   LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
   std::wstring command = argc > 1 ? argv[1] : L"";
+  std::wstring arg2 = argc > 2 ? argv[2] : L"";
   if (argv)
     LocalFree(argv);
 
@@ -255,7 +404,8 @@ int wmain() {
   }
 
   std::wstring root = ModuleRoot();
-  if (!IsAdmin() && command != L"status" && command != L"fix-userdir") {
+  if (!IsAdmin() && command != L"status" && command != L"fix-userdir" &&
+      command != L"schemas" && command != L"set-schema") {
     Print(L"[auth] requiring administrator privileges");
     return RelaunchElevated(command);
   }
@@ -275,6 +425,17 @@ int wmain() {
   }
   if (command == L"status")
     return DoStatus(root);
+  if (command == L"schemas") {
+    DoListSchemas();
+    return 0;
+  }
+  if (command == L"set-schema") {
+    if (arg2.empty()) {
+      Print(L"[set-schema] usage: set-schema <schema_id>");
+      return 2;
+    }
+    return DoSetSchema(arg2);
+  }
 
   Print(L"unknown command: " + command);
   return 2;
