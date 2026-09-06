@@ -76,6 +76,8 @@ internal static class Program {
   private static AutomationEventHandler _textChangedHandler;
   private static DateTime _lastKey = DateTime.MinValue;
   private static string _lastLogged = null;
+  private static int _prevLen = 0;
+  private static bool _hasPrev = false;
 
   private static Native.LowLevelKeyboardProc _keyProc;
   private static IntPtr _hook = IntPtr.Zero;
@@ -264,6 +266,8 @@ internal static class Program {
       Automation.AddAutomationEventHandler(TextPattern.TextChangedEvent, element,
                                            TreeScope.Element, _textChangedHandler);
       _subscribed = element;
+      _prevLen = 0;
+      _hasPrev = false;
       LogLine("[focus] subscribed text-changed on " + Describe(element));
     } catch { }
   }
@@ -353,11 +357,17 @@ internal static class Program {
     // is committed onto the document does a non-ASCII (CJK/punct) tail
     // appear. Treat that as the sole "上屏" trigger.
     if (trimmed.Length == 0 || IsAsciiLetter(trimmed[trimmed.Length - 1])) return;
-    string stripped = Regex.Replace(trimmed, "[A-Za-z]+$", "");
+    string stripped = Regex.Replace(trimmed, "[A-Za-z]+$", "").TrimEnd();
     if (string.IsNullOrWhiteSpace(stripped)) return;
     string keyed = (DateTime.Now - _lastKey).TotalMilliseconds <= 2500 ? "key" : "other";
 
     lock (_gate) {
+      // Forward-typing gate: log only when the context strictly grows versus
+      // the previous state. This drops backspace cascades and duplicate
+      // text+trailing-space events from the same commit.
+      if (_hasPrev && stripped.Length <= _prevLen) return;
+      _hasPrev = true;
+      _prevLen = stripped.Length;
       if (_lastLogged != null && _lastLogged == stripped) return;
       _lastLogged = stripped;
     }
@@ -366,7 +376,7 @@ internal static class Program {
                   " rebuild=yes ctx(" + stripped.Length + "/" + _maxChars + "): " + stripped;
     LogLine(line);
     AppendDiag("[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] rawN=" + rawContext.Length +
-               " cleanN=" + trimmed.Length + " removed=[" + RemovedSet(rawContext, trimmed) +
+               " cleanN=" + stripped.Length + " removed=[" + RemovedSet(rawContext, trimmed) +
                "]\n  raw_cps=" + CodePoints(rawContext.Length > _maxChars
                    ? rawContext.Substring(rawContext.Length - _maxChars)
                    : rawContext) +
