@@ -1,11 +1,8 @@
-﻿@echo off
-chcp 65001 >nul
-setlocal
-set HERE=%~dp0
-set EXE=%HERE%WeaselExpContextV0.exe
-if not exist "%EXE%" (
-  echo [exp-v0] exe not found: %EXE%
-  exit /b 1
-)
-echo [exp-v0] cli_emojiless_exp_v0 - context reader (Ctrl+C to stop)
-"%EXE%" -n 100
+﻿@echo off
+chcp 65001 >nul
+setlocal
+set HERE=%~dp0
+if not exist "%HERE%diag" mkdir "%HERE%diag"
+echo [exp-v0] logging to %HERE%diag\exp-run.log (Ctrl+C to stop)
+"%HERE%WeaselExpContextV0.exe" -n 100 -log "%HERE%diag\exp-run.log" -diag "%HERE%diag\exp-diag.log"
+echo [exp-v0] logs: %HERE%diag\exp-run.log / exp-diag.log
