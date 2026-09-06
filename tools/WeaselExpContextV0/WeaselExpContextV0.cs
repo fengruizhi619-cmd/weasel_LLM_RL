@@ -134,6 +134,10 @@ internal static class Program {
     }
   }
 
+  private static bool IsAsciiLetter(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+  }
+
   private static void LogLine(string text) {
     lock (_gate) {
       Console.WriteLine(text);
@@ -214,6 +218,11 @@ internal static class Program {
 
     string trimmed = context;
     if (trimmed.Length > _maxChars) trimmed = trimmed.Substring(trimmed.Length - _maxChars);
+    // [EXP-006] commit-only trigger: while IME composition is live the
+    // pre-caret text ends with ASCII pinyin letters; only when the candidate
+    // is committed onto the document does a non-ASCII (CJK/punct) tail
+    // appear. Treat that as the sole "上屏" trigger.
+    if (trimmed.Length == 0 || IsAsciiLetter(trimmed[trimmed.Length - 1])) return;
     string stripped = Regex.Replace(trimmed, "[A-Za-z]+$", "");
     string keyed = (DateTime.Now - _lastKey).TotalMilliseconds <= 2500 ? "key" : "other";
 

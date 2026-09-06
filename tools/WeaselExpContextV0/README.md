@@ -7,6 +7,9 @@ untouched and adds context reading as an external hook process.
 - Trigger state machine: user key -> IME commit (UIA TextChanged)
   -> rebuild tree? (exp: always yes) -> read N chars before caret
   -> strip trailing ASCII letters [A-Za-z]+ -> log context (console + file).
+- Commit-only trigger: changes whose pre-caret text ends in ASCII letters
+  (IME composition/pinyin still live or plain typing) are ignored; only a
+  non-ASCII (CJK/punctuation) tail means the candidate was committed.
 - Keyboard hook (WH_KEYBOARD_LL) only annotates whether the change came
   from physical keys (src=key) or elsewhere (src=other).
 
