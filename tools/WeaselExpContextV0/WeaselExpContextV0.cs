@@ -68,6 +68,8 @@ internal static class Program {
   private static int _maxChars = 100;
   private static string _logPath = "";
   private static StreamWriter _log;
+  private static string _diagPath = "";
+  private static StreamWriter _diag;
   private static readonly object _gate = new object();
 
   private static AutomationElement _subscribed;
@@ -78,6 +80,45 @@ internal static class Program {
   private static Native.LowLevelKeyboardProc _keyProc;
   private static IntPtr _hook = IntPtr.Zero;
   private static volatile bool _running = true;
+
+  // [EXP-008 DIAG]
+  private static string CodePoints(string text) {
+    var sb = new StringBuilder();
+    for (int i = 0; i < text.Length; i++) {
+      int cp;
+      if (char.IsHighSurrogate(text[i]) && i + 1 < text.Length &&
+          char.IsLowSurrogate(text[i + 1])) {
+        cp = char.ConvertToUtf32(text[i], text[i + 1]);
+        i++;
+      } else {
+        cp = text[i];
+      }
+      if (sb.Length > 0)
+        sb.Append(' ');
+      sb.Append("U+").Append(cp.ToString("X4"));
+    }
+    return sb.ToString();
+  }
+
+  private static string RemovedSet(string raw, string clean) {
+    var sb = new StringBuilder();
+    for (int i = 0; i < raw.Length; i++) {
+      string one = raw.Substring(i, 1);
+      if (one != RemoveInvisible(one)) {
+        if (sb.Length > 0)
+          sb.Append(';');
+        sb.Append(CodePoints(one));
+      }
+    }
+    return sb.ToString();
+  }
+
+  private static void AppendDiag(string line) {
+    lock (_gate) {
+      if (_diag != null)
+        _diag.WriteLine(line);
+    }
+  }
 
   // [EXP-003 SELF-TEST]
   private static void SelfTest() {
@@ -112,6 +153,10 @@ internal static class Program {
       _log = new StreamWriter(_logPath, true, new UTF8Encoding(false));
       _log.AutoFlush = true;
     }
+    if (_diagPath.Length > 0) {
+      _diag = new StreamWriter(_diagPath, true, new UTF8Encoding(false));
+      _diag.AutoFlush = true;
+    }
     Console.CancelKeyPress += delegate { _running = false; Native.PostThreadMessageW(Native.GetCurrentThreadId(), Native.WM_QUIT, IntPtr.Zero, IntPtr.Zero); };
 
     _keyProc = KeyboardProc;
@@ -140,6 +185,7 @@ internal static class Program {
     if (_hook != IntPtr.Zero) Native.UnhookWindowsHookEx(_hook);
     try { Automation.RemoveAutomationFocusChangedEventHandler(new AutomationFocusChangedEventHandler(OnFocusChanged)); } catch { }
     if (_log != null) _log.Close();
+    if (_diag != null) _diag.Close();
     Console.WriteLine("[exp-v0] stopped");
     return 0;
   }
@@ -152,6 +198,9 @@ internal static class Program {
         i++;
       } else if ((args[i] == "-log" || args[i] == "--log") && i + 1 < args.Length) {
         _logPath = args[i + 1];
+        i++;
+      } else if ((args[i] == "-diag" || args[i] == "--diag") && i + 1 < args.Length) {
+        _diagPath = args[i + 1];
         i++;
       }
     }
@@ -206,6 +255,7 @@ internal static class Program {
     if (element == null) return;
     try {
       if (element == _subscribed) return;
+      if (IsConsoleHost(element)) return;
       Unsubscribe();
       if (!(bool)element.GetCurrentPropertyValue(AutomationElement.IsTextPatternAvailableProperty))
         return;
@@ -236,6 +286,34 @@ internal static class Program {
     }
   }
 
+  // [EXP-009 CONSOLE-GUARD]
+  // Never subscribe to the console/terminal that hosts this reader: printing
+  // log lines changes the terminal text, which fires TextChanged and creates
+  // a self-feedback loop (the observed duplicate lines with CR/LF + spaces).
+  private static bool IsConsoleHost(AutomationElement element) {
+    try {
+      string className = element.Current.ClassName;
+      if (className != null) {
+        string cl = className.ToLowerInvariant();
+        if (cl.Contains("termcontrol") || cl.Contains("consolewindow") ||
+            cl.Contains("cascadia"))
+          return true;
+      }
+      int pid = (int)element.GetCurrentPropertyValue(AutomationElement.ProcessIdProperty);
+      using (System.Diagnostics.Process proc = System.Diagnostics.Process.GetProcessById(pid)) {
+        string name = proc.ProcessName.ToLowerInvariant();
+        if (name == "windowsterminal" || name == "windowsterminalpreview" ||
+            name == "openconsole" || name == "conhost" || name == "cmd" ||
+            name == "powershell" || name == "pwsh" || name == "wezterm" ||
+            name == "mintty" || name == "alacritty")
+          return true;
+      }
+    } catch {
+      return false;
+    }
+    return false;
+  }
+
   private static string Describe(AutomationElement element) {
     try {
       return element.Current.Name + " / " + element.Current.ClassName;
@@ -261,10 +339,11 @@ internal static class Program {
   // [EXP-006 TEXT-CHANGED PIPELINE]
   private static void OnTextChanged(object sender, AutomationEventArgs e) {
     AutomationElement element = sender as AutomationElement;
-    if (element == null || IsSelfProcess(element)) return;
+    if (element == null || IsSelfProcess(element) || IsConsoleHost(element)) return;
 
     string context = ReadContext(element);
     if (context == null) return;
+    string rawContext = context;
     context = RemoveInvisible(context);
 
     string trimmed = context;
@@ -275,6 +354,7 @@ internal static class Program {
     // appear. Treat that as the sole "上屏" trigger.
     if (trimmed.Length == 0 || IsAsciiLetter(trimmed[trimmed.Length - 1])) return;
     string stripped = Regex.Replace(trimmed, "[A-Za-z]+$", "");
+    if (string.IsNullOrWhiteSpace(stripped)) return;
     string keyed = (DateTime.Now - _lastKey).TotalMilliseconds <= 2500 ? "key" : "other";
 
     lock (_gate) {
@@ -285,6 +365,12 @@ internal static class Program {
     string line = "[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] src=" + keyed +
                   " rebuild=yes ctx(" + stripped.Length + "/" + _maxChars + "): " + stripped;
     LogLine(line);
+    AppendDiag("[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] rawN=" + rawContext.Length +
+               " cleanN=" + trimmed.Length + " removed=[" + RemovedSet(rawContext, trimmed) +
+               "]\n  raw_cps=" + CodePoints(rawContext.Length > _maxChars
+                   ? rawContext.Substring(rawContext.Length - _maxChars)
+                   : rawContext) +
+               "\n  clean_cps=" + CodePoints(stripped));
   }
 
   private static string ReadContext(AutomationElement element) {

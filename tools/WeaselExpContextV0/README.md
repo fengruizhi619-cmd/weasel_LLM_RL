@@ -22,3 +22,6 @@ modifying the Weasel core.
   IME or editor (U+200B/U+200C/U+200D/FEFF/word-joiner/LTR-RTL marks etc.)
   are stripped before context is logged, so one visible commit yields one
   stable-length context line.
+- Console guard: the reader never subscribes to its own console/terminal
+  window, otherwise printing logs changes the terminal text and creates a
+  self-feedback loop (duplicate lines padded with CR/LF and spaces).
