@@ -124,11 +124,62 @@ static int SetRegistry(const std::wstring& root) {
   return result == ERROR_SUCCESS ? 0 : 1;
 }
 
+static int SetCurrentUserRimeRegistry() {
+  wchar_t user_data[MAX_PATH]{};
+  if (!ExpandEnvironmentStringsW(L"%APPDATA%\\Rime", user_data, MAX_PATH))
+    return 1;
+
+  HKEY key = nullptr;
+  LONG result = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Rime\\Weasel",
+                                0, nullptr, 0, KEY_SET_VALUE, nullptr, &key,
+                                nullptr);
+  if (result != ERROR_SUCCESS)
+    return 1;
+
+  const std::wstring rime_user_dir = user_data;
+  const std::wstring profile = L"hans";
+  DWORD hant = 0;
+  RegSetValueExW(key, L"RimeUserDir", 0, REG_SZ,
+                 reinterpret_cast<const BYTE*>(rime_user_dir.c_str()),
+                 static_cast<DWORD>((rime_user_dir.size() + 1) *
+                                    sizeof(wchar_t)));
+  RegSetValueExW(key, L"Profile", 0, REG_SZ,
+                 reinterpret_cast<const BYTE*>(profile.c_str()),
+                 static_cast<DWORD>((profile.size() + 1) * sizeof(wchar_t)));
+  RegSetValueExW(key, L"Hant", 0, REG_DWORD,
+                 reinterpret_cast<const BYTE*>(&hant), sizeof(hant));
+  RegCloseKey(key);
+  return 0;
+}
+
+static void ClearCurrentUserRimeRegistry() {
+  RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\Rime\\Weasel");
+}
+
+static void PrintUserDirStatus() {
+  wchar_t value[MAX_PATH]{};
+  DWORD value_size = sizeof(value);
+  HKEY key = nullptr;
+  LONG result =
+      RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\Rime\\Weasel", 0,
+                    KEY_QUERY_VALUE, &key);
+  if (result == ERROR_SUCCESS) {
+    result = RegQueryValueExW(key, L"RimeUserDir", nullptr, nullptr,
+                              reinterpret_cast<LPBYTE>(value), &value_size);
+    RegCloseKey(key);
+  }
+  if (result == ERROR_SUCCESS && value[0])
+    Print(L"[status] user data dir=" + std::wstring(value));
+  else
+    Print(L"[status] user data dir=(not set)");
+}
+
 static void PrintUsage() {
   Print(L"WeaselCliInstaller [command]");
   Print(L"  install   - silent install from this package root");
   Print(L"  uninstall - silent uninstall of registered Weasel TSF");
   Print(L"  deploy    - deploy Rime user workspace");
+  Print(L"  fix-userdir - force RimeUserDir to %APPDATA%\\Rime");
   Print(L"  status    - print current installation status");
 }
 
@@ -140,7 +191,13 @@ static int DoInstall(const std::wstring& root) {
   int setup = RunFile(root, L"WeaselSetup.exe", L"/s");
   if (setup != 0)
     return setup;
-  int deployer = RunFile(root, L"WeaselDeployer.exe", L"/install");
+  if (SetCurrentUserRimeRegistry() != 0) {
+    Print(L"[ERROR] cannot overwrite HKCU RimeUserDir");
+    return 1;
+  }
+  Print(L"[install] RimeUserDir overwritten to %APPDATA%\\Rime");
+  // /install shows the GUI first-run wizard; /deploy is the headless equivalent.
+  int deployer = RunFile(root, L"WeaselDeployer.exe", L"/deploy");
   if (deployer != 0)
     return deployer;
   if (SetRegistry(root) != 0)
@@ -151,7 +208,10 @@ static int DoInstall(const std::wstring& root) {
 static int DoUninstall(const std::wstring& root) {
   Print(L"[uninstall] root=" + root);
   RunFile(root, L"WeaselServer.exe", L"/q");
-  return RunFile(root, L"WeaselSetup.exe", L"/u");
+  int setup = RunFile(root, L"WeaselSetup.exe", L"/u");
+  ClearCurrentUserRimeRegistry();
+  Print(L"[uninstall] HKCU Software\\Rime\\Weasel cleared");
+  return setup;
 }
 
 static int DoDeploy(const std::wstring& root) {
@@ -176,6 +236,7 @@ static int DoStatus(const std::wstring& root) {
     Print(L"[status] installed root=" + std::wstring(value));
   else
     Print(L"[status] installed root=(not set)");
+  PrintUserDirStatus();
   return 0;
 }
 
@@ -194,7 +255,7 @@ int wmain() {
   }
 
   std::wstring root = ModuleRoot();
-  if (!IsAdmin() && command != L"status") {
+  if (!IsAdmin() && command != L"status" && command != L"fix-userdir") {
     Print(L"[auth] requiring administrator privileges");
     return RelaunchElevated(command);
   }
@@ -205,6 +266,13 @@ int wmain() {
     return DoUninstall(root);
   if (command == L"deploy")
     return DoDeploy(root);
+  if (command == L"fix-userdir") {
+    Print(L"[fix-userdir] overwriting HKCU RimeUserDir");
+    if (SetCurrentUserRimeRegistry() != 0)
+      return 1;
+    Print(L"[fix-userdir] done");
+    return 0;
+  }
   if (command == L"status")
     return DoStatus(root);
 
