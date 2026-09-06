@@ -61,6 +61,8 @@ if is_arch("x86") then
   includes("WeaselSetup")
 end
 
+includes("tools/WeaselCliInstaller")
+
 if is_mode("debug") then
   includes("test/TestWeaselIPC")
   includes("test/TestResponseParser")
