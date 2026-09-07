@@ -37,7 +37,7 @@ DEFAULT_WIDTH = 5
 DEFAULT_DEPTH = 5
 DEFAULT_CTX_CHARS = 100
 CTX_SIZE = 1024
-PARALLEL_SLOTS = 8
+PARALLEL_SLOTS = 1
 MAX_WORKERS = 8
 REQUEST_TIMEOUT = 30
 SERVER_STARTUP_TIMEOUT = 30
@@ -146,6 +146,7 @@ class LlamaServer:
 
     def query_top_n(self, prompt, n):
         """POST /completion, return list of {tok_str, p} for top n."""
+        _t0 = time.monotonic()
         payload = {
             "prompt": prompt,
             "n_predict": 1,
@@ -159,6 +160,10 @@ class LlamaServer:
         r = requests.post(self.base + "/completion", json=payload,
                           timeout=REQUEST_TIMEOUT)
         r.raise_for_status()
+        _lat = time.monotonic() - _t0
+        if not hasattr(self, "_latencies"):
+            self._latencies = []
+        self._latencies.append(_lat)
         data = r.json()
         probs_list = data.get("completion_probabilities", [])
         if not probs_list:
@@ -180,80 +185,46 @@ class LlamaServer:
 
 
 def build_tree(server, prompt_text, width, depth):
+    """DFS traversal: maximizes KV cache hits (consecutive queries share prefix)."""
     root = TreeNode(depth=0)
-    frontier = [(root, prompt_text)]
     stats = {"requests": 0, "nodes": 1, "leaves": 0}
 
-    for level in range(depth):
-        if not frontier:
-            break
-        next_frontier = []
+    def dfs(node, full_prompt, cur_depth):
+        if cur_depth >= depth:
+            node.is_leaf = True
+            node.stop_reason = "depth"
+            stats["leaves"] += 1
+            return
 
-        def expand(args):
-            node, full_prompt = args
-            return node, full_prompt, server.query_top_n(full_prompt, width)
+        candidates = server.query_top_n(full_prompt, width)
+        stats["requests"] += 1
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = [pool.submit(expand, item) for item in frontier]
-            for future in concurrent.futures.as_completed(futures):
-                node, full_prompt, candidates = future.result()
-                stats["requests"] += 1
+        for cand in candidates:
+            tok = cand.get("tok_str", "")
+            p = cand.get("p", 0.0)
+            if not tok:
+                continue
 
-                for cand in candidates:
-                    tok = cand.get("tok_str", "")
-                    p = cand.get("p", 0.0)
-                    if not tok:
-                        continue
+            cum = node.cum_prob * p
+            child = TreeNode(token=tok, prob=p, cum_prob=cum,
+                             parent=node, depth=cur_depth + 1)
+            node.children.append(child)
+            stats["nodes"] += 1
 
-                    cum = node.cum_prob * p
-                    child = TreeNode(token=tok, prob=p, cum_prob=cum,
-                                     parent=node, depth=node.depth + 1)
-                    node.children.append(child)
-                    stats["nodes"] += 1
-
-                    if is_eos_like(tok):
-                        child.is_leaf = True
-                        child.stop_reason = "eos"
-                        stats["leaves"] += 1
-                    elif is_punct(tok):
-                        child.is_leaf = True
-                        child.stop_reason = "punct"
-                        stats["leaves"] += 1
-                    else:
-                        next_frontier.append((child, full_prompt + tok))
-
-        if level == depth - 1:
-            for child_node, _ in next_frontier:
-                child_node.is_leaf = True
-                child_node.stop_reason = "depth"
+            if is_eos_like(tok):
+                child.is_leaf = True
+                child.stop_reason = "eos"
                 stats["leaves"] += 1
-            next_frontier = []
+            elif is_punct(tok):
+                child.is_leaf = True
+                child.stop_reason = "punct"
+                stats["leaves"] += 1
+            else:
+                dfs(child, full_prompt + tok, cur_depth + 1)
 
-        frontier = next_frontier
-        print(f"  [tree] level {level + 1}/{depth} done, "
-              f"frontier={len(frontier)} nodes={stats['nodes']} "
-              f"leaves={stats['leaves']}", file=sys.stderr)
-
+    dfs(root, prompt_text, 0)
     return root, stats
 
-
-# ---------------------------------------------------------------- display
-
-
-def _print_tree(node, prefix, is_last, file):
-    if node.is_root:
-        print(prefix + "(root)", file=file)
-    else:
-        connector = "\u2514\u2500 " if is_last else "\u251c\u2500 "
-        p_str = f" p={node.prob:.4f}"
-        stop = ""
-        if node.is_leaf and node.stop_reason:
-            stop = f" [{node.stop_reason}]"
-        print(prefix + connector + repr(node.token) + p_str + stop, file=file)
-
-    child_prefix = prefix + ("   " if is_last else "\u2502  ")
-    for i, child in enumerate(node.children):
-        _print_tree(child, child_prefix, i == len(node.children) - 1, file)
 
 
 def print_tree(root, file=sys.stdout):
@@ -335,6 +306,27 @@ def main():
         print(f"[tree-exp] tree built in {elapsed:.2f}s, "
               f"requests={stats['requests']} nodes={stats['nodes']} "
               f"leaves={stats['leaves']}", flush=True)
+
+        # timing breakdown
+        if hasattr(srv, "_latencies") and srv._latencies:
+            lats = sorted(srv._latencies)
+            n_req = len(lats)
+            total_req_time = sum(lats)
+            print(f"\n[tree-exp] === TIMING BREAKDOWN ===", flush=True)
+            print(f"  total requests:     {n_req}", flush=True)
+            print(f"  total request time: {total_req_time:.2f}s", flush=True)
+            print(f"  avg latency:        {total_req_time/n_req*1000:.1f}ms", flush=True)
+            print(f"  min latency:        {lats[0]*1000:.1f}ms", flush=True)
+            print(f"  p50:                {lats[n_req//2]*1000:.1f}ms", flush=True)
+            print(f"  p95:                {lats[int(n_req*0.95)]*1000:.1f}ms", flush=True)
+            print(f"  max latency:        {lats[-1]*1000:.1f}ms", flush=True)
+            # concurrency speedup estimate
+            sequential_estimate = total_req_time  # if done one by one
+            actual_time = elapsed
+            speedup = sequential_estimate / actual_time if actual_time > 0 else 0
+            print(f"  sequential est:     {sequential_estimate:.2f}s", flush=True)
+            print(f"  actual (concurrent):{actual_time:.2f}s", flush=True)
+            print(f"  concurrency speedup: {speedup:.1f}x", flush=True)
 
         # collect leaves
         leaves = []
