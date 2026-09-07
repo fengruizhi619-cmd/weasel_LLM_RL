@@ -18,87 +18,7 @@ if HERE not in sys.path:
 
 import unified_pipeline as up
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-except Exception:
-    pass
-
-
-class _TeeStream:
-    def __init__(self, primary, sink):
-        self.primary = primary
-        self.sink = sink
-
-    def write(self, text):
-        self.primary.write(text)
-        self.sink.write(text)
-
-    def flush(self):
-        self.primary.flush()
-        self.sink.flush()
-
-
-def _enable_watch_log(log_file):
-    try:
-        path = os.path.join(os.path.dirname(log_file), "unified-watcher.log")
-        sink = open(path, "a", encoding="utf-8", errors="replace")
-        sys.stdout = _TeeStream(sys.stdout, sink)
-        sys.stderr = _TeeStream(sys.stderr, sink)
-    except OSError:
-        pass
-
 CTX_RE = re.compile(r"ctx\(\d+/\d+\):\s(.+?)\s*$")
-
-
-GHOST_DIR = os.path.join(os.environ.get("APPDATA", ""), "Rime")
-GHOST_FILE = os.path.join(GHOST_DIR, "llm_inline_ghost.txt")
-
-FNV_OFFSET = 14695981039346656037
-FNV_PRIME = 1099511628211
-FNV_MASK = (1 << 64) - 1
-
-GHOST_MARKER_RE = re.compile(r"(?:<[^<>\n]{1,200}>)+$")
-
-
-def clean_ghost_markers(context):
-    open_sentinel = "\u2063"
-    close_sentinel = "\u2064"
-    while True:
-        start = context.find(open_sentinel)
-        if start < 0:
-            break
-        end = context.find(close_sentinel, start + 1)
-        if end < 0:
-            break
-        context = context[:start] + context[end + 1:]
-    return GHOST_MARKER_RE.sub("", context)
-
-
-def ghost_hash(context):
-    value = FNV_OFFSET
-    for byte in context.encode("utf-8"):
-        value = ((value ^ byte) * FNV_PRIME) & FNV_MASK
-    return value
-
-
-def clear_ghost_file():
-    try:
-        if os.path.exists(GHOST_FILE):
-            os.remove(GHOST_FILE)
-    except OSError:
-        pass
-
-
-def write_ghost_file(context, suggestion):
-    try:
-        os.makedirs(GHOST_DIR, exist_ok=True)
-        text = suggestion or ""
-        text = text.replace("\n", " ").replace("\r", " ")
-        with open(GHOST_FILE, "w", encoding="utf-8") as f:
-            f.write(format(ghost_hash(context), "x") + "\n" + text + "\n")
-    except OSError:
-        pass
 
 SLOTS = [
     ("lm_head_t0.pt", 10),
@@ -182,8 +102,6 @@ def main():
     ap.add_argument("--dtype", choices=["float32", "bfloat16", "float16"],
                     default="bfloat16" if up.DEVICE == "cuda" else "float32")
     ap.add_argument("--fp8", action="store_true")
-    ap.add_argument("--skip-ckpt", action="store_true",
-                    help="start from the base lm_head, do not load slots")
     ap.add_argument("--rl-lr", type=float, default=up.LR)
     ap.add_argument("-n", type=int, default=up.WIDTH)
     ap.add_argument("-d", type=int, default=up.DEPTH)
@@ -196,7 +114,6 @@ def main():
     ckpt_dir = args.ckpt_dir or os.path.join(
         os.path.dirname(log_file), "checkpoints")
 
-    _enable_watch_log(log_file)
     print("[v0.2] unified full-chain watcher: "
           "context -> reward -> tree -> RL -> checkpoint", flush=True)
     print(f"[v0.2] log={log_file} model={args.model} "
@@ -205,9 +122,7 @@ def main():
     engine = up.TreeEngine(args.model, lr=args.rl_lr, device=args.device,
                            dtype=args.dtype, fp8=args.fp8)
     ckpt = CheckpointManager(engine, ckpt_dir)
-    if args.skip_ckpt:
-        print("[v0.2] skip checkpoint load: base lm_head", flush=True)
-    elif ckpt.load_latest():
+    if ckpt.load_latest():
         print(f"[v0.2] resumed updates={ckpt.updates}", flush=True)
 
     if not os.path.exists(log_file):
@@ -245,7 +160,6 @@ def main():
                 if not m:
                     continue
                 ctx_text = m.group(1).strip()
-                ctx_text = clean_ghost_markers(ctx_text)
                 if not ctx_text:
                     continue
                 if len(ctx_text) > args.ctx_chars:
@@ -253,7 +167,6 @@ def main():
                 if ctx_text == prev_context:
                     continue
                 commit_count += 1
-                clear_ghost_file()
 
                 reward = 0.0
                 reward_path = ""
@@ -278,24 +191,19 @@ def main():
                     ctx_text, args.n, args.d)
 
                 print(f"\n{'=' * 60}", flush=True)
-                print(f"[commit #{commit_count}]", flush=True)
-                print(f"[context] {ctx_text!r}", flush=True)
+                print(f"[commit #{commit_count}] ctx={ctx_text!r}", flush=True)
                 print(f"[tree] {stats['time']:.2f}s "
                       f"nodes={stats['nodes']} leaves={stats['leaves']} "
                       f"forward_calls={stats.get('forward_calls', 0)}",
                       flush=True)
                 if leaves:
-                    print(f"[candidates] top {min(10, len(leaves))} "
-                          f"by cum P:", flush=True)
-                    for i, leaf in enumerate(leaves[:10], 1):
-                        print(f"  {i:2d}. P={leaf.cum:.6f} {leaf.path!r}",
+                    print(f"[top {min(3, len(leaves))}]:", flush=True)
+                    for i, leaf in enumerate(leaves[:3], 1):
+                        print(f"  {i}. P={leaf.cum:.6f} {leaf.path!r}",
                               flush=True)
-                ghost_sentence = leaves[0].path if leaves else ""
-                print(f"[ghost-display] {ghost_sentence!r}", flush=True)
                 if rl_line:
                     print(f"[RL]{rl_line}", flush=True)
 
-                write_ghost_file(ctx_text, ghost_sentence)
                 prev_context = ctx_text
                 prev_tree = root
 
