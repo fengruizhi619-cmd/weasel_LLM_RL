@@ -132,7 +132,7 @@ def main():
     ap.add_argument("--server",default=r"E:\llama.cpp\llama-server.exe")
     ap.add_argument("--ctx-chars",type=int,default=CTX_CHARS)
     ap.add_argument("--rl-lr",type=float,default=LR)
-    ap.add_argument("--checkpoint",default="",help="lm_head checkpoint save path")
+    ap.add_argument("--ckpt-dir",default="",help="checkpoint directory for multi-slot saves")
     ap.add_argument("--save-interval",type=int,default=20,help="commits between auto-saves")
     ap.add_argument("--llama-port",type=int,default=0,help="0=auto")
     args=ap.parse_args()
@@ -159,36 +159,68 @@ def main():
     optimizer=torch.optim.SGD([model.lm_head.weight],lr=args.rl_lr)
     print(f"[v0.2] model ready on {DEVICE}, lr={args.rl_lr}",flush=True)
 
-    # checkpoint state
-    ckpt_path = args.checkpoint if args.checkpoint else ""
+    # [V02-005 CHECKPOINT] multi-slot time-diluted
+    SLOT_INTERVALS = [0, 300, 1500, 7200, 43200]  # 0, 5min, 25min, 2h, 12h
+    SLOT_NAMES = ["realtime", "5min", "25min", "2h", "12h"]
+    NUM_SLOTS = 5
+    ckpt_dir = os.path.join(os.path.dirname(args.log_file), "checkpoints") if args.ckpt_dir else ""
+    if ckpt_dir:
+        os.makedirs(ckpt_dir, exist_ok=True)
+
     _dirty = False
-    _commits_since_save = 0
     _total_updates = 0
+    _last_slot_save = [0.0] * NUM_SLOTS  # monotonic timestamps
 
-    def save_checkpoint(path):
-        nonlocal _dirty, _commits_since_save
-        if not path or not _dirty:
-            return
+    def _slot_path(slot):
+        return os.path.join(ckpt_dir, f"slot_{slot}_{SLOT_NAMES[slot]}.pt")
+
+    def _write_slot(slot):
         w = model.lm_head.weight.data.cpu().half()
-        torch.save({"lm_head_weight": w, "updates": _total_updates,
-                    "timestamp": time.strftime("%Y%m%d_%H%M%S")}, path)
-        _dirty = False
-        _commits_since_save = 0
-        print(f"[v0.2] [checkpoint] saved lm_head to {path} "
-              f"(updates={_total_updates}, size={os.path.getsize(path)//1024}KB)", flush=True)
+        torch.save({
+            "lm_head_weight": w,
+            "updates": _total_updates,
+            "slot": slot,
+            "timestamp": time.strftime("%Y%m%d_%H%M%S"),
+        }, _slot_path(slot))
+        print(f"[v0.2] [ckpt] slot {slot}({SLOT_NAMES[slot]}) saved, "
+              f"updates={_total_updates}", flush=True)
 
-    def load_checkpoint(path):
-        if not path or not os.path.exists(path):
+    def save_checkpoint():
+        nonlocal _dirty, _last_slot_save
+        if not ckpt_dir or not _dirty:
+            return
+        now = time.monotonic()
+        # slot 0: always save if dirty
+        _write_slot(0)
+        _last_slot_save[0] = now
+        # slots 1-4: save if interval elapsed
+        for slot in range(1, NUM_SLOTS):
+            if now - _last_slot_save[slot] >= SLOT_INTERVALS[slot]:
+                _write_slot(slot)
+                _last_slot_save[slot] = now
+        _dirty = False
+
+    def load_checkpoint():
+        if not ckpt_dir:
             return False
-        ckpt = torch.load(path, map_location=DEVICE)
-        model.lm_head.weight.data.copy_(ckpt["lm_head_weight"].float())
-        print(f"[v0.2] [checkpoint] loaded lm_head from {path} "
-              f"(updates={ckpt.get('updates','?')})", flush=True)
-        return True
+        # try newest slot first, fall back to older
+        for slot in range(NUM_SLOTS):
+            path = _slot_path(slot)
+            if os.path.exists(path):
+                try:
+                    ckpt = torch.load(path, map_location=DEVICE)
+                    model.lm_head.weight.data.copy_(ckpt["lm_head_weight"].float())
+                    print(f"[v0.2] [ckpt] loaded slot {slot}({SLOT_NAMES[slot]}) "
+                          f"updates={ckpt.get('updates','?')}", flush=True)
+                    return True
+                except Exception as e:
+                    print(f"[v0.2] [ckpt] slot {slot} corrupted ({e}), trying next...", flush=True)
+        print(f"[v0.2] [ckpt] no checkpoint found, starting fresh", flush=True)
+        return False
 
     # load existing checkpoint
-    if ckpt_path:
-        load_checkpoint(ckpt_path)
+    if ckpt_dir:
+        load_checkpoint()
 
     # start llama-server for tree API (separate from PyTorch model)
     port=args.llama_port if args.llama_port else free_port()
@@ -275,11 +307,9 @@ def main():
                     loss=rl_update(model,optimizer,hidden,target_id,reward)
                     _dirty = True
                     _total_updates += 1
-                    _commits_since_save += 1
                     print(f"[v0.2] [RL] updated lm_head, loss={loss:.6f} "
                           f"(total_updates={_total_updates})",flush=True)
-                    if _commits_since_save >= args.save_interval:
-                        save_checkpoint(ckpt_path)
+                    save_checkpoint()
 
                     # re-query to show change
                     new_cands=get_top_k_pytorch(model,tokenizer,input_ids,3)
