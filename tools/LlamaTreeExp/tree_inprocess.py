@@ -55,6 +55,7 @@ def get_top_candidates(llm, k):
 
 
 def build_tree_dfs(llm, prompt_tokens, width, depth, stats):
+    """DFS with incremental KV: no save_state/load_state, just n_tokens truncation."""
     root = Node(depth=0)
 
     def dfs(node, cur_depth):
@@ -66,7 +67,8 @@ def build_tree_dfs(llm, prompt_tokens, width, depth, stats):
         candidates = get_top_candidates(llm, width)
         stats["requests"] += 1
 
-        snapshot = llm.save_state()
+        # Record branch point: just an integer, zero memory cost
+        branch_ntokens = llm.n_tokens
 
         for i, cand in enumerate(candidates):
             tok, p, tid = cand["tok"], cand["p"], cand["id"]
@@ -82,16 +84,21 @@ def build_tree_dfs(llm, prompt_tokens, width, depth, stats):
             elif is_punct(tok):
                 child.is_leaf = True; child.stop = "punct"; stats["leaves"] += 1
             else:
+                # Truncate KV to branch point, then eval ONLY the new token
+                llm.n_tokens = branch_ntokens
+                llm._ctx.kv_cache_seq_rm(-1, branch_ntokens, -1)
                 llm.eval([tid])
+                # Recurse (KV now includes this child's token)
                 dfs(child, cur_depth + 1)
-                llm.load_state(snapshot)
+                # After recursion, KV is at the deepest point of this subtree
+                # The next sibling iteration will truncate back to branch_ntokens
 
-        del snapshot
+        # After exploring all children, truncate back to branch point
+        llm.n_tokens = branch_ntokens
+        llm._ctx.kv_cache_seq_rm(-1, branch_ntokens, -1)
 
-    dfs(root, 0)
+    dfs(root := Node(depth=0), 0)
     return root, stats
-
-
 def print_tree(node, prefix="", is_last=True):
     if node.is_root:
         print(prefix + "(root)")
