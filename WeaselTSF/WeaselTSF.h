@@ -3,7 +3,6 @@
 #include "Globals.h"
 #include <WeaselIPC.h>
 #include <WeaselIPCData.h>
-#include "InlineGhost.h"
 
 class CCandidateList;
 class CLangBarItemButton;
@@ -127,33 +126,6 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   void _FinalizeComposition();
   void _AbortComposition(bool clear = true);
 
-  /* Inline LLM ghost */
-  BOOL _HasRimeComposition() const { return _status.composing; }
-  BOOL _IsGhostInlineActive() const { return _inlineGhostActive; }
-  void _ShowGhostInline(TfEditCookie ec, ITfContext* pContext,
-                        const std::wstring& text);
-  void _ReplaceGhostInline(TfEditCookie ec, ITfContext* pContext,
-                           const std::wstring& text);
-  const std::wstring& _GetGhostCommitText() const {
-    return _inlineGhostCommitText;
-  }
-  BOOL _HandleGhostKey(ITfContext* pContext, WPARAM wParam, LPARAM lParam,
-                       BOOL* pfEaten, bool test_only);
-  void _PublishTsContext(ITfContext* pContext, TfEditCookie ec);
-  void _SetInlineGhostCombinedHash(uint64_t hash) {
-    _inlineGhostCombinedHash = hash;
-  }
-  void _SetInlineGhostBaseContextHash(uint64_t hash) {
-    _inlineGhostBaseContextHash = hash;
-  }
-  BOOL _IsGhostBusy() const { return _ghostBusy; }
-  void _SetGhostBusy(BOOL busy) { _ghostBusy = busy; }
-  BOOL _IsGhostSuppressedAfterCancel() const {
-    return _ghostSuppressAfterCancel;
-  }
-  void _CommitGhostComposition(ITfContext* pContext);
-  void _CancelGhostComposition(ITfContext* pContext);
-
   /* Language bar */
   HWND _GetFocusedContextWindow();
   void _HandleLangBarMenuSelect(UINT wID);
@@ -200,8 +172,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
 
   BOOL _InitKeyEventSink();
   void _UninitKeyEventSink();
-  void _ProcessKeyEvent(ITfContext* pContext, WPARAM wParam, LPARAM lParam,
-                        BOOL* pfEaten, bool test_only);
+  void _ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten);
 
   BOOL _InitPreservedKey();
   void _UninitPreservedKey();
@@ -213,18 +184,6 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   void _EnableLanguageBar(BOOL enable);
 
   BOOL _InsertText(com_ptr<ITfContext> pContext, const std::wstring& ext);
-
-  void _ScheduleInlineGhostCheck();
-  void _CancelInlineGhostScheduler();
-  void _RunGhostScheduledCheck();
-  BOOL _EnsureGhostMessageWindow();
-  void _StartGhostFileWatcher();
-  void _StopGhostFileWatcher();
-  void _ScheduleGhostHide();
-  void _CancelGhostHideTimer();
-  static LRESULT CALLBACK _GhostMessageWindowProc(HWND hwnd, UINT message,
-                                                  WPARAM wParam,
-                                                  LPARAM lParam);
 
   void _DeleteCandidateList();
 
@@ -277,20 +236,4 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   BOOL _async_edit = false;
   BOOL _committed = false;
   BOOL _isToOpenClose = false;
-
-  /* Inline LLM ghost state */
-  BOOL _inlineGhostActive = FALSE;
-  BOOL _ghostKeyAcceptPending = FALSE;
-  int _ghostCheckRetries = 0;
-  uint64_t _inlineGhostCombinedHash = 0;
-  uint64_t _inlineGhostBaseContextHash = 0;
-  BOOL _ghostSuppressAfterCancel = FALSE;
-  BOOL _ghostBusy = FALSE;
-  std::wstring _inlineGhostCommitText;
-  HWND _ghostMessageWindow = nullptr;
-  HANDLE _ghostTimerQueue = nullptr;
-  HANDLE _ghostTimer = nullptr;
-  HANDLE _ghostHideTimer = nullptr;
-  HANDLE _ghostWatcherThread = nullptr;
-  HANDLE _ghostWatcherStop = nullptr;
 };

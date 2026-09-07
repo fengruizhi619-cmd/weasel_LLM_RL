@@ -8,24 +8,11 @@ static weasel::KeyEvent prevKeyEvent;
 static BOOL prevfEaten = FALSE;
 static int keyCountToSimulate = 0;
 
-void WeaselTSF::_ProcessKeyEvent(ITfContext* pContext, WPARAM wParam,
-                                LPARAM lParam, BOOL* pfEaten,
-                                bool test_only) {
+void WeaselTSF::_ProcessKeyEvent(WPARAM wParam, LPARAM lParam, BOOL* pfEaten) {
   // when _IsKeyboardDisabled don't eat the key,
   // when keyboard closable and keyboard closed, don't eat the key
   if ((_isToOpenClose && !_IsKeyboardOpen()) || _IsKeyboardDisabled()) {
     *pfEaten = FALSE;
-    return;
-  }
-
-  if (_HandleGhostKey(pContext, wParam, lParam, pfEaten, test_only)) {
-    weasel::KeyEvent ghost_key_event;
-    GetKeyboardState(_lpbKeyState);
-    if (ConvertKeyEvent(static_cast<UINT>(wParam), lParam, _lpbKeyState,
-                        ghost_key_event)) {
-      prevfEaten = *pfEaten;
-      prevKeyEvent = ghost_key_event;
-    }
     return;
   }
 
@@ -80,8 +67,6 @@ STDMETHODIMP WeaselTSF::OnSetFocus(BOOL fForeground) {
     m_client.FocusIn();
   else {
     m_client.FocusOut();
-    _inlineGhostActive = FALSE;
-    _CancelInlineGhostScheduler();
     _AbortComposition();
   }
 
@@ -107,7 +92,7 @@ STDMETHODIMP WeaselTSF::OnTestKeyDown(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
-  _ProcessKeyEvent(pContext, wParam, lParam, pfEaten, true);
+  _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
     _fTestKeyDownPending = TRUE;
@@ -121,11 +106,9 @@ STDMETHODIMP WeaselTSF::OnKeyDown(ITfContext* pContext,
   _fTestKeyUpPending = FALSE;
   if (_fTestKeyDownPending) {
     _fTestKeyDownPending = FALSE;
-    if (_ghostKeyAcceptPending)
-      _CommitGhostComposition(pContext);
     *pfEaten = TRUE;
   } else {
-    _ProcessKeyEvent(pContext, wParam, lParam, pfEaten, false);
+    _ProcessKeyEvent(wParam, lParam, pfEaten);
     _UpdateComposition(pContext);
   }
   return S_OK;
@@ -140,7 +123,7 @@ STDMETHODIMP WeaselTSF::OnTestKeyUp(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
-  _ProcessKeyEvent(pContext, wParam, lParam, pfEaten, true);
+  _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
     _fTestKeyUpPending = TRUE;
@@ -156,7 +139,7 @@ STDMETHODIMP WeaselTSF::OnKeyUp(ITfContext* pContext,
     _fTestKeyUpPending = FALSE;
     *pfEaten = TRUE;
   } else {
-    _ProcessKeyEvent(pContext, wParam, lParam, pfEaten, false);
+    _ProcessKeyEvent(wParam, lParam, pfEaten);
     if (!_async_edit)
       _UpdateComposition(pContext);
   }
