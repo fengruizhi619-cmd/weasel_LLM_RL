@@ -8,12 +8,12 @@ const WCHAR _daiDescription[] = L"Weasel Display Attribute Input";
 
 // change style only, leave color to app
 const TF_DISPLAYATTRIBUTE _daiDisplayAttribute = {
-    {TF_CT_NONE, 0},  // text color
-    {TF_CT_NONE, 0},  // background color (TF_CT_NONE => app default)
-    TF_LS_DOT,        // underline style
-    FALSE,            // underline boldness
-    {TF_CT_NONE, 0},  // underline color
-    TF_ATTR_INPUT     // attribute info
+    {TF_CT_COLORREF, RGB(90, 90, 90)},  // gray text for preview
+    {TF_CT_NONE, 0},                    // background stays app default
+    TF_LS_SOLID,                        // solid underline
+    TRUE,                               // bold underline
+    {TF_CT_NONE, 0},                    // underline color
+    TF_ATTR_INPUT                       // attribute info
 };
 
 CDisplayAttributeInfoInput::CDisplayAttributeInfoInput() {

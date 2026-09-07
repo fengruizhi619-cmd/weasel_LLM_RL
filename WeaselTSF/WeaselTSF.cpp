@@ -97,6 +97,9 @@ STDMETHODIMP WeaselTSF::Activate(ITfThreadMgr* pThreadMgr,
 }
 
 STDMETHODIMP WeaselTSF::Deactivate() {
+  _inlineGhostActive = FALSE;
+  _CancelInlineGhostScheduler();
+
   m_client.EndSession();
 
   _InitTextEditSink(com_ptr<ITfDocumentMgr>());
@@ -161,6 +164,7 @@ STDMETHODIMP WeaselTSF::ActivateEx(ITfThreadMgr* pThreadMgr,
   if (!_InitThreadFocusSink())
     goto ExitError;
 
+  _EnsureGhostMessageWindow();
   _EnsureServerConnected();
 
   return S_OK;
@@ -185,6 +189,8 @@ STDMETHODIMP WeaselTSF::OnSetThreadFocus() {
   return S_OK;
 }
 STDMETHODIMP WeaselTSF::OnKillThreadFocus() {
+  _inlineGhostActive = FALSE;
+  _CancelInlineGhostScheduler();
   _AbortComposition();
   return S_OK;
 }
