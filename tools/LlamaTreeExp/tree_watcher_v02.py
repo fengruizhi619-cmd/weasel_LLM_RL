@@ -1,329 +1,340 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""cli_emojiless_exp_v0.2 - context reader + candidate tree + online RL.
+"""cli_emojiless_exp_v0.2 - complete end-to-end RL loop.
 
-Pipeline:
-  C# reader detects commit → writes to log file
-  This script tails log → parses context → builds candidate tree
-    (caches hidden state) → user types → reward → zero-cost lm_head update
+Context reader → build tree → save predictions
+→ user types → next commit → compare actual vs predicted
+→ reward = p × match_ratio → update lm_head → repeat
 """
 
-import argparse, concurrent.futures, json, math, os, re, socket, subprocess, sys, threading, time, unicodedata
+import argparse, json, math, os, re, sys, time, unicodedata
+import numpy as np
+from llama_cpp import Llama
 
-import torch
-import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+DEFAULT_MODEL = r"E:\llama.cpp\models\Qwen3-0.6B-Base-Q8_0.gguf"
+WIDTH = 5
+DEPTH = 5
+TOP_N = 10
+CTX_CHARS = 100
+LR = 1e-4
 
-try:
-    import requests
-except ImportError:
-    print("[ERROR] pip install requests"); sys.exit(1)
 
-# ---- config ----
-MODEL_PATH   = r"E:\codex_data\研究\models\Qwen3-0.6B-Base"
-DEVICE       = "cuda" if torch.cuda.is_available() else "cpu"
-LR           = 1e-4
-WIDTH        = 5
-DEPTH        = 5
-TOP_N        = 5
-CTX_CHARS    = 100
-CTX_SIZE     = 1024
-PARALLEL     = 8
-MAX_WORKERS  = 8
-REQ_TIMEOUT  = 30
-LOG_POLL     = 0.15
+def is_punct(t):
+    return any(unicodedata.category(c).startswith("P") for c in t)
 
-# ---- node ----
+def is_eos_like(t):
+    lo = t.lower()
+    return "endoftext" in lo or "eos" in lo or "<|im_end|>" in lo or t in ("\n", "\r\n")
+
+
 class Node:
-    __slots__ = ("token","prob","cum_prob","parent","children","is_leaf","stop","depth","hidden")
+    __slots__ = ("tok","p","cum","parent","children","is_leaf","stop","depth")
     def __init__(self, tok="", p=1.0, cum=1.0, parent=None, depth=0):
-        self.token=tok; self.prob=p; self.cum_prob=cum
-        self.parent=parent; self.children=[]; self.is_leaf=False
-        self.stop=""; self.depth=depth; self.hidden=None
+        self.tok=tok; self.p=p; self.cum=cum
+        self.parent=parent; self.children=[]
+        self.is_leaf=False; self.stop=""; self.depth=depth
     @property
     def path(self):
         parts=[]; n=self
-        while n and n.parent: parts.append(n.token); n=n.parent
+        while n and n.parent: parts.append(n.tok); n=n.parent
         return "".join(reversed(parts))
     @property
     def is_root(self): return self.parent is None
 
-# ---- utils ----
-def is_punct(t):
-    return any(unicodedata.category(c).startswith("P") for c in t)
-def is_eos(t):
-    lo=t.lower()
-    return "endoftext" in lo or "eos" in lo or "<|im_end|>" in lo or t in("\n","\r\n")
-def free_port():
-    with socket.socket(socket.AF_INET,socket.SOCK_STREAM) as s: s.bind(("",0)); return s.getsockname()[1]
 
-# ---- llama-server (for candidate tree API) ----
-class TreeServer:
-    def __init__(self, exe, model, port):
-        self.port=port
-        self.base=f"http://127.0.0.1:{port}"; self._proc=None
-        self._exe=exe; self._model=model
-    def start(self):
-        self._proc=subprocess.Popen(
-            [self._exe,"-m",self._model,"--port",str(self.port),
-             "--ctx-size","1024","--parallel","8","--cont-batching","--no-warmup"],
-            stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess,"CREATE_NO_WINDOW",0))
-        # fix: extract port from base url
-        deadline=time.monotonic()+30
-        while time.monotonic()<deadline:
-            try:
-                if requests.get(self.base+"/health",timeout=2).status_code==200: return
-            except: pass
-            time.sleep(0.3)
-        raise RuntimeError("server not healthy")
-    def stop(self):
-        if self._proc: self._proc.terminate()
-        try: self._proc.wait(timeout=5)
-        except: self._proc.kill()
-    def top_n(self, prompt, n):
-        r=requests.post(self.base+"/completion", json={
-            "prompt":prompt,"n_predict":1,"n_probs":n,
-            "temperature":1.0,"top_k":0,"top_p":1.0,"min_p":0.0,"cache_prompt":True
-        }, timeout=REQ_TIMEOUT)
-        r.raise_for_status()
-        lp=r.json().get("completion_probabilities",[{}])[0].get("top_logprobs",[])
-        return [{"tok":i.get("token",""),"p":math.exp(i.get("logprob",-999)),"id":i.get("id",0)} for i in lp]
+def get_top_candidates(llm, k):
+    raw = llm.eval_logits
+    logits = np.asarray(list(raw)[-1] if hasattr(raw, "__iter__") and not isinstance(raw, np.ndarray) else raw, dtype=np.float64)
+    logits = logits - logits.max()
+    exp = np.exp(logits)
+    probs = exp / exp.sum()
+    top_idx = np.argsort(probs)[::-1][:k]
+    out = []
+    for idx in top_idx:
+        tok_bytes = llm.detokenize([int(idx)])
+        tok = tok_bytes.decode("utf-8", errors="replace")
+        out.append({"tok": tok, "p": float(probs[idx]), "id": int(idx)})
+    return out
 
-# ---- RL update (zero-cost, uses cached hidden) ----
-def rl_update(model, optimizer, hidden, target_id, reward):
-    """hidden: (1,1,1024) cached from tree build. Zero backbone cost."""
-    model.train()
-    # lm_head forward using cached hidden (no backbone re-forward)
-    logits = model.lm_head(hidden)  # (1,1,vocab)
-    logits = logits[0,-1,:]  # (vocab,)
-    log_probs = F.log_softmax(logits, dim=-1)
-    loss = -reward * log_probs[target_id]
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
-    model.eval()
-    return loss.item()
 
-def get_hidden(model, input_ids):
-    """Run backbone only (no lm_head), return hidden state at last position."""
-    with torch.no_grad():
-        out = model.model(input_ids=input_ids)  # backbone only
-        hidden = out.last_hidden_state[:, -1, :].unsqueeze(1)  # (1,1,hidden_dim)
-    return hidden
+def build_tree_dfs(llm, prompt_tokens, width, depth, stats):
+    root = Node(depth=0)
 
-def get_top_k_pytorch(model, tokenizer, input_ids, k=5):
-    with torch.no_grad():
-        out = model(input_ids)
-        logits = out.logits[0,-1,:]
-        probs = F.softmax(logits, dim=-1)
-        top_p, top_id = torch.topk(probs, k)
-    return [{"tok":tokenizer.decode(top_id[i].item()),"p":top_p[i].item(),
-             "id":top_id[i].item()} for i in range(top_id.shape[0])]
+    def dfs(node, cur_depth):
+        if cur_depth >= depth:
+            node.is_leaf = True; node.stop = "depth"
+            stats["leaves"] += 1; return
+        candidates = get_top_candidates(llm, width)
+        stats["requests"] += 1
+        branch_ntokens = llm.n_tokens
+        snapshot = llm.save_state()
+        for i, cand in enumerate(candidates):
+            tok, p, tid = cand["tok"], cand["p"], cand["id"]
+            if not tok: continue
+            cum = node.cum * p
+            child = Node(tok=tok, p=p, cum=cum, parent=node, depth=cur_depth + 1)
+            node.children.append(child); stats["nodes"] += 1
+            if is_eos_like(tok):
+                child.is_leaf = True; child.stop = "eos"; stats["leaves"] += 1
+            elif is_punct(tok):
+                child.is_leaf = True; child.stop = "punct"; stats["leaves"] += 1
+            else:
+                llm.n_tokens = branch_ntokens
+                llm._ctx.kv_cache_seq_rm(-1, branch_ntokens, -1)
+                llm.eval([tid])
+                dfs(child, cur_depth + 1)
+                llm.n_tokens = branch_ntokens
+                llm._ctx.kv_cache_seq_rm(-1, branch_ntokens, -1)
+        del snapshot
 
-# ---- main ----
+    dfs(root, 0)
+    return root, stats
+
+
+def collect_leaves(root):
+    leaves = []
+    def col(n):
+        if n.is_leaf and not n.is_root: leaves.append(n)
+        for c in n.children: col(c)
+    col(root)
+    leaves.sort(key=lambda n: n.cum, reverse=True)
+    return leaves
+
+
+def print_tree(node, prefix="", is_last=True):
+    if node.is_root:
+        print(prefix + "(root)")
+    else:
+        conn = "\u2514\u2500 " if is_last else "\u251c\u2500 "
+        p = f" p={node.p:.4f}"
+        stop = f" [{node.stop}]" if node.stop else ""
+        print(prefix + conn + repr(node.tok) + p + stop)
+    cp = prefix + ("   " if is_last else "\u2502  ")
+    for i, c in enumerate(node.children):
+        print_tree(c, cp, i == len(node.children) - 1)
+
+
 def main():
-    ap=argparse.ArgumentParser(description="cli_emojiless_exp_v0.2")
-    ap.add_argument("--log-file",required=True)
-    ap.add_argument("-n",type=int,default=WIDTH)
-    ap.add_argument("-d",type=int,default=DEPTH)
-    ap.add_argument("--top-n",type=int,default=TOP_N)
-    ap.add_argument("--model",default=MODEL_PATH)
-    ap.add_argument("--server",default=r"E:\llama.cpp\llama-server.exe")
-    ap.add_argument("--ctx-chars",type=int,default=CTX_CHARS)
-    ap.add_argument("--rl-lr",type=float,default=LR)
-    ap.add_argument("--ckpt-dir",default="",help="checkpoint directory for multi-slot saves")
-    ap.add_argument("--save-interval",type=int,default=20,help="commits between auto-saves")
-    ap.add_argument("--llama-port",type=int,default=0,help="0=auto")
-    args=ap.parse_args()
+    ap = argparse.ArgumentParser(description="cli_emojiless_exp_v0.2 end-to-end RL")
+    ap.add_argument("--log-file", required=True)
+    ap.add_argument("-n", type=int, default=WIDTH)
+    ap.add_argument("-d", type=int, default=DEPTH)
+    ap.add_argument("--top-n", type=int, default=TOP_N)
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--ctx-chars", type=int, default=CTX_CHARS)
+    ap.add_argument("--rl-lr", type=float, default=LR)
+    ap.add_argument("--ckpt-dir", default="")
+    args = ap.parse_args()
 
-    log_file=os.path.abspath(args.log_file)
+    import torch
+    import torch.nn.functional as F
+    import torch.nn as nn
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    log_file = os.path.abspath(args.log_file)
     if not os.path.exists(log_file):
-        print(f"[v0.2] log not found: {log_file}",file=sys.stderr); return 1
-    last_pos=os.path.getsize(log_file)
-    print(f"[v0.2] watching {log_file} (offset {last_pos})",flush=True)
+        print(f"[v0.2] log not found: {log_file}", file=sys.stderr); return 1
+    last_pos = os.path.getsize(log_file)
 
-    # load PyTorch model (for RL + candidate generation via PyTorch)
-    print(f"[v0.2] loading model {args.model}",flush=True)
-    tokenizer=AutoTokenizer.from_pretrained(args.model)
-    model=AutoModelForCausalLM.from_pretrained(args.model).to(DEVICE)
-
-    # untie lm_head
+    # Load PyTorch model for RL
+    print(f"[v0.2] loading RL model: {args.model}", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    model = AutoModelForCausalLM.from_pretrained(args.model).to("cuda")
     if model.lm_head.weight is model.model.embed_tokens.weight:
-        print("[v0.2] untying lm_head from embed_tokens",flush=True)
-        import torch.nn as nn
-        model.lm_head.weight=nn.Parameter(model.model.embed_tokens.weight.data.clone())
+        model.lm_head.weight = nn.Parameter(model.model.embed_tokens.weight.data.clone())
+    for p_ in model.parameters(): p_.requires_grad = False
+    model.lm_head.weight.requires_grad = True
+    optimizer = torch.optim.SGD([model.lm_head.weight], lr=args.rl_lr)
+    print(f"[v0.2] model ready (lm_head trainable, lr={args.rl_lr})", flush=True)
 
-    for p in model.parameters(): p.requires_grad=False
-    model.lm_head.weight.requires_grad=True
-    optimizer=torch.optim.SGD([model.lm_head.weight],lr=args.rl_lr)
-    print(f"[v0.2] model ready on {DEVICE}, lr={args.rl_lr}",flush=True)
+    # Load llama.cpp for tree building
+    print(f"[v0.2] loading llama.cpp: {args.model}", flush=True)
+    llm = Llama(model_path=args.model, n_ctx=1024, n_gpu_layers=-1,
+                logits_all=True, verbose=False)
+    print(f"[v0.2] llama.cpp ready", flush=True)
 
-    # [V02-005 CHECKPOINT] multi-slot time-diluted
-    SLOT_INTERVALS = [0, 300, 1500, 7200, 43200]  # 0, 5min, 25min, 2h, 12h
-    SLOT_NAMES = ["realtime", "5min", "25min", "2h", "12h"]
-    NUM_SLOTS = 5
-    ckpt_dir = os.path.join(os.path.dirname(args.log_file), "checkpoints") if args.ckpt_dir else ""
-    if ckpt_dir:
-        os.makedirs(ckpt_dir, exist_ok=True)
+    # State for end-to-end RL loop
+    prev_tree = None       # last tree's root node
+    prev_context = ""      # context used to build last tree
+    prev_input_ids = None  # input_ids used for last tree build
+    prev_leaves = []       # sorted leaves from last tree
 
+    running = True
+    commit_count = 0
+    rl_update_count = 0
+    import signal as sig_mod
+    def handler(sig, frame):
+        nonlocal running; running = False
+    sig_mod.signal(sig_mod.SIGINT, handler)
+
+    ckpt_dir = os.path.join(os.path.dirname(log_file), "checkpoints")
+    os.makedirs(ckpt_dir, exist_ok=True)
     _dirty = False
     _total_updates = 0
-    _last_slot_save = [0.0] * NUM_SLOTS  # monotonic timestamps
 
-    def _slot_path(slot):
-        return os.path.join(ckpt_dir, f"slot_{slot}_{SLOT_NAMES[slot]}.pt")
-
-    def _write_slot(slot):
+    def save_ckpt():
+        nonlocal _dirty
+        if not _dirty: return
         w = model.lm_head.weight.data.cpu().half()
-        torch.save({
-            "lm_head_weight": w,
-            "updates": _total_updates,
-            "slot": slot,
-            "timestamp": time.strftime("%Y%m%d_%H%M%S"),
-        }, _slot_path(slot))
-        print(f"[v0.2] [ckpt] slot {slot}({SLOT_NAMES[slot]}) saved, "
-              f"updates={_total_updates}", flush=True)
-
-    def save_checkpoint():
-        nonlocal _dirty, _last_slot_save
-        if not ckpt_dir or not _dirty:
-            return
-        now = time.monotonic()
-        # slot 0: always save if dirty
-        _write_slot(0)
-        _last_slot_save[0] = now
-        # slots 1-4: save if interval elapsed
-        for slot in range(1, NUM_SLOTS):
-            if now - _last_slot_save[slot] >= SLOT_INTERVALS[slot]:
-                _write_slot(slot)
-                _last_slot_save[slot] = now
+        torch.save({"lm_head_weight": w, "updates": _total_updates,
+                    "timestamp": time.strftime("%Y%m%d_%H%M%S")},
+                   os.path.join(ckpt_dir, "lm_head.pt"))
         _dirty = False
+        print(f"[v0.2] [ckpt] saved (updates={_total_updates})", flush=True)
 
-    def load_checkpoint():
-        if not ckpt_dir:
-            return False
-        # try newest slot first, fall back to older
-        for slot in range(NUM_SLOTS):
-            path = _slot_path(slot)
-            if os.path.exists(path):
-                try:
-                    ckpt = torch.load(path, map_location=DEVICE)
-                    model.lm_head.weight.data.copy_(ckpt["lm_head_weight"].float())
-                    print(f"[v0.2] [ckpt] loaded slot {slot}({SLOT_NAMES[slot]}) "
-                          f"updates={ckpt.get('updates','?')}", flush=True)
-                    return True
-                except Exception as e:
-                    print(f"[v0.2] [ckpt] slot {slot} corrupted ({e}), trying next...", flush=True)
-        print(f"[v0.2] [ckpt] no checkpoint found, starting fresh", flush=True)
-        return False
-
-    # load existing checkpoint
-    if ckpt_dir:
-        load_checkpoint()
-
-    # start llama-server for tree API (separate from PyTorch model)
-    port=args.llama_port if args.llama_port else free_port()
-    print(f"[v0.2] starting llama-server on port {port}",flush=True)
-    gguf = args.model if '.gguf' in args.model else r"E:\llama.cpp\models\Qwen3-0.6B-Base-Q8_0.gguf"
-    tsrv=TreeServer(args.server,gguf,port)
-    try: tsrv.start()
-    except Exception as e:
-        print(f"[v0.2] [WARN] llama-server failed: {e}, using PyTorch only",flush=True)
-        tsrv=None
-
-    print(f"[v0.2] ready. type Chinese in any app, Ctrl+C to stop\n",flush=True)
-
-    running=True; commits=0
-    import signal as sig_mod
-    def handler(sig,frame):
-        nonlocal running; running=False
-    sig_mod.signal(sig_mod.SIGINT,handler)
-
-    # hidden state cache: context_text → (hidden_tensor, input_ids)
-    hidden_cache={}
+    print(f"\n[v0.2] ready. Type Chinese in any app with Weasel. Ctrl+C to stop.\n", flush=True)
 
     try:
         while running:
-            time.sleep(LOG_POLL)
+            time.sleep(0.15)
             if not os.path.exists(log_file): continue
-            cur=os.path.getsize(log_file)
-            if cur<=last_pos: continue
-            with open(log_file,"r",encoding="utf-8",errors="replace") as f:
-                f.seek(last_pos); new=f.read()
-            last_pos=os.path.getsize(log_file)
+            cur_size = os.path.getsize(log_file)
+            if cur_size <= last_pos: continue
 
-            for line in new.splitlines():
-                m=re.search(r"ctx\(\d+/\d+\):\s(.+)",line)
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(last_pos); new_content = f.read()
+            last_pos = os.path.getsize(log_file)
+
+            for line in new_content.splitlines():
+                m = re.search(r"ctx\(\d+/\d+\):\s(.+)", line)
                 if not m: continue
-                ctx=m.group(1).strip()
-                if not ctx: continue
-                if len(ctx)>args.ctx_chars: ctx=ctx[-args.ctx_chars:]
-                commits+=1
+                ctx_text = m.group(1).strip()
+                if not ctx_text: continue
+                if len(ctx_text) > args.ctx_chars:
+                    ctx_text = ctx_text[-args.ctx_chars:]
+                commit_count += 1
 
-                print(f"\n{'='*60}",flush=True)
-                print(f"[commit #{commits}] ctx: {ctx!r}",flush=True)
-                print(f"{'='*60}",flush=True)
+                # ==== STEP 1: Check reward against previous tree predictions ====
+                reward = 0.0
+                reward_info = ""
+                if prev_tree and prev_context:
+                    if ctx_text.startswith(prev_context):
+                        # User's new text extends our predicted context
+                        new_chars = ctx_text[len(prev_context):]
+                        # Find the longest matching leaf path
+                        best_match = None
+                        def find_match(node):
+                            nonlocal best_match
+                            if node.is_leaf and ctx_text.startswith(node.path):
+                                if best_match is None or len(node.path) > len(best_match.path):
+                                    best_match = node
+                            for c in node.children:
+                                find_match(c)
+                        find_match(prev_tree)
+                        if best_match:
+                            # Calculate how many chars of the prediction the user confirmed
+                            matched_len = len(best_match.path)
+                            total_leaves = len(prev_leaves)
+                            # Find this leaf's probability in the tree
+                            reward = best_match.cum
+                            reward_info = (f"predicted_path={best_match.path!r} "
+                                           f"P={reward:.6f}")
+                        else:
+                            # User typed something not in the tree (went off-path)
+                            reward_info = "off-path"
+                    else:
+                        reward_info = "diverged"
 
-                t0=time.monotonic()
+                # ==== STEP 2: RL update if we have a positive reward ====
+                if reward > 0 and prev_input_ids is not None:
+                    # Get hidden state for previous context
+                    with torch.no_grad():
+                        prev_ids = tokenizer.encode(prev_context, return_tensors="pt").to("cuda")
+                        hidden = model.model(input_ids=prev_ids).last_hidden_state[0, -1, :]
+                        if hidden.dtype != torch.float32:
+                            hidden = hidden.float()
 
-                # build candidate tree via llama-server
-                try:
-                    cands=tsrv.top_n(ctx,args.n) if tsrv else []
-                except Exception as e:
-                    print(f"[v0.2] [WARN] tree API error: {e}",flush=True); cands=[]
+                    # Find target token: the new characters the user typed
+                    new_part = ctx_text[len(prev_context):] if ctx_text.startswith(prev_context) else ctx_text
+                    target_tokens = tokenizer.encode(new_part, add_special_tokens=False)
+                    if target_tokens:
+                        target_id = target_tokens[0]  # first new token
 
-                # PyTorch forward: get hidden state for RL
-                input_ids=tokenizer.encode(ctx,return_tensors="pt").to(DEVICE)
-                hidden=get_hidden(model,input_ids)
-                hidden_cache[ctx]=(hidden,input_ids)
+                        model.train()
+                        logits = model.lm_head(hidden)
+                        log_probs = F.log_softmax(logits, dim=-1)
+                        loss = -reward * log_probs[target_id]
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        model.eval()
+                        _dirty = True
+                        _total_updates += 1
+                        rl_update_count += 1
+                        reward_info += f" [RL] loss={loss.item():.4f}"
 
-                # show tree-level candidates from llama-server
-                if cands:
-                    for i,c in enumerate(cands):
-                        print(f"  tree[{i+1}] {c['tok']!r} p={c['p']:.4f}",flush=True)
+                # ==== STEP 3: Build new tree from current context ====
+                t0 = time.monotonic()
+                prompt_tokens = llm.tokenize(ctx_text.encode("utf-8"))
+                llm.eval(prompt_tokens)
+                root, stats = build_tree_dfs(llm, prompt_tokens, args.n, args.d,
+                                             {"requests": 0, "nodes": 1, "leaves": 0})
+                elapsed = time.monotonic() - t0
+                leaves = collect_leaves(root)
 
-                # PyTorch top-k (for RL target lookup)
-                pt_cands=get_top_k_pytorch(model,tokenizer,input_ids,args.n)
+                # Save for next round
+                prev_context = ctx_text
+                prev_input_ids = prompt_tokens
 
-                elapsed=time.monotonic()-t0
-                print(f"[v0.2] tree built {elapsed:.2f}s | "
-                      f"llama={len(cands)} pytorch={len(pt_cands)} cands",flush=True)
+                # Display
+                print(f"\n{'='*60}", flush=True)
+                print(f"[commit #{commit_count}] ctx={ctx_text!r}", flush=True)
+                if reward_info:
+                    print(f"[reward] {reward_info}", flush=True)
+                if reward > 0:
+                    print(f"[RL] reward={reward:.4f} updates={_total_updates}", flush=True)
+                print(f"[tree] {elapsed:.2f}s req={stats['requests']} "
+                      f"nodes={stats['nodes']} leaves={stats['leaves']}", flush=True)
+                if leaves:
+                    print(f"[top {min(3, len(leaves))}]:", flush=True)
+                    for i, lf in enumerate(leaves[:3], 1):
+                        print(f"  {i}. P={lf.cum:.6f} {lf.path!r}", flush=True)
 
-                # simulate: show PyTorch top candidates for RL
-                for i,c in enumerate(pt_cands[:args.top_n]):
-                    print(f"  pt[{i+1}] p={c['p']:.4f} {c['tok']!r}",flush=True)
-
-                # simulate user typing: pick the top candidate for demo
-                # (real version: user types via IME, we match)
-                if pt_cands:
-                    user_tok=pt_cands[0]
-                    reward=user_tok["p"]  # full match
-                    target_id=user_tok["id"]
-                    print(f"[v0.2] [RL] user picked {user_tok['tok']!r} "
-                          f"reward={reward:.4f}",flush=True)
-
-                    # zero-cost RL update using cached hidden
-                    loss=rl_update(model,optimizer,hidden,target_id,reward)
-                    _dirty = True
-                    _total_updates += 1
-                    print(f"[v0.2] [RL] updated lm_head, loss={loss:.6f} "
-                          f"(total_updates={_total_updates})",flush=True)
-                    save_checkpoint()
-
-                    # re-query to show change
-                    new_cands=get_top_k_pytorch(model,tokenizer,input_ids,3)
-                    for i,c in enumerate(new_cands):
-                        marker=" ←" if c["id"]==target_id else ""
-                        print(f"  after[{i+1}] p={c['p']:.4f} {c['tok']!r}{marker}",flush=True)
+                if _dirty and commit_count % 20 == 0:
+                    save_ckpt()
 
     except Exception as e:
-        print(f"[v0.2] [ERROR] {e}",file=sys.stderr)
+        print(f"[v0.2] [ERROR] {e}", file=sys.stderr)
     finally:
-        if tsrv: tsrv.stop()
-        save_checkpoint(ckpt_path)
-        print(f"\n[v0.2] stopped. commits={commits} total_updates={_total_updates}",flush=True)
+        save_ckpt()
+        print(f"\n[v0.2] stopped. commits={commit_count} rl_updates={rl_update_count}", flush=True)
     return 0
 
-if __name__=="__main__":
+
+def collect_leaves(root):
+    leaves = []
+    def col(n):
+        if n.is_leaf and not n.is_root: leaves.append(n)
+        for c in n.children: col(c)
+    col(root)
+    leaves.sort(key=lambda n: n.cum, reverse=True)
+    return leaves
+
+
+def print_tree(node, prefix="", is_last=True):
+    if node.is_root:
+        print(prefix + "(root)")
+    else:
+        conn = "\u2514\u2500 " if is_last else "\u251c\u2500 "
+        p = f" p={node.p:.4f}"
+        stop = f" [{node.stop}]" if node.stop else ""
+        print(prefix + conn + repr(node.tok) + p + stop)
+    cp = prefix + ("   " if is_last else "\u2502  ")
+    for i, c in enumerate(node.children):
+        print_tree(c, cp, i == len(node.children) - 1)
+
+
+def print_leaves(root):
+    leaves = []
+    def col(n):
+        if n.is_leaf and not n.is_root: leaves.append(n)
+        for c in n.children: col(c)
+    col(root)
+    leaves.sort(key=lambda n: n.cum, reverse=True)
+    print(f"\n=== leaves ({len(leaves)}) by cum prob ===")
+    for i, lf in enumerate(leaves[:20], 1):
+        print(f"  {i:3d}. P={lf.cum:.6f} d={lf.depth} stop={lf.stop:6s} {lf.path!r}")
+
+
+if __name__ == "__main__":
     sys.exit(main())
