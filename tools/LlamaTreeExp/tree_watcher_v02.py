@@ -132,6 +132,8 @@ def main():
     ap.add_argument("--server",default=r"E:\llama.cpp\llama-server.exe")
     ap.add_argument("--ctx-chars",type=int,default=CTX_CHARS)
     ap.add_argument("--rl-lr",type=float,default=LR)
+    ap.add_argument("--checkpoint",default="",help="lm_head checkpoint save path")
+    ap.add_argument("--save-interval",type=int,default=20,help="commits between auto-saves")
     ap.add_argument("--llama-port",type=int,default=0,help="0=auto")
     args=ap.parse_args()
 
@@ -156,6 +158,37 @@ def main():
     model.lm_head.weight.requires_grad=True
     optimizer=torch.optim.SGD([model.lm_head.weight],lr=args.rl_lr)
     print(f"[v0.2] model ready on {DEVICE}, lr={args.rl_lr}",flush=True)
+
+    # checkpoint state
+    ckpt_path = args.checkpoint if args.checkpoint else ""
+    _dirty = False
+    _commits_since_save = 0
+    _total_updates = 0
+
+    def save_checkpoint(path):
+        nonlocal _dirty, _commits_since_save
+        if not path or not _dirty:
+            return
+        w = model.lm_head.weight.data.cpu().half()
+        torch.save({"lm_head_weight": w, "updates": _total_updates,
+                    "timestamp": time.strftime("%Y%m%d_%H%M%S")}, path)
+        _dirty = False
+        _commits_since_save = 0
+        print(f"[v0.2] [checkpoint] saved lm_head to {path} "
+              f"(updates={_total_updates}, size={os.path.getsize(path)//1024}KB)", flush=True)
+
+    def load_checkpoint(path):
+        if not path or not os.path.exists(path):
+            return False
+        ckpt = torch.load(path, map_location=DEVICE)
+        model.lm_head.weight.data.copy_(ckpt["lm_head_weight"].float())
+        print(f"[v0.2] [checkpoint] loaded lm_head from {path} "
+              f"(updates={ckpt.get('updates','?')})", flush=True)
+        return True
+
+    # load existing checkpoint
+    if ckpt_path:
+        load_checkpoint(ckpt_path)
 
     # start llama-server for tree API (separate from PyTorch model)
     port=args.llama_port if args.llama_port else free_port()
@@ -240,7 +273,13 @@ def main():
 
                     # zero-cost RL update using cached hidden
                     loss=rl_update(model,optimizer,hidden,target_id,reward)
-                    print(f"[v0.2] [RL] updated lm_head, loss={loss:.6f}",flush=True)
+                    _dirty = True
+                    _total_updates += 1
+                    _commits_since_save += 1
+                    print(f"[v0.2] [RL] updated lm_head, loss={loss:.6f} "
+                          f"(total_updates={_total_updates})",flush=True)
+                    if _commits_since_save >= args.save_interval:
+                        save_checkpoint(ckpt_path)
 
                     # re-query to show change
                     new_cands=get_top_k_pytorch(model,tokenizer,input_ids,3)
@@ -252,7 +291,8 @@ def main():
         print(f"[v0.2] [ERROR] {e}",file=sys.stderr)
     finally:
         if tsrv: tsrv.stop()
-        print(f"\n[v0.2] stopped. commits={commits}",flush=True)
+        save_checkpoint(ckpt_path)
+        print(f"\n[v0.2] stopped. commits={commits} total_updates={_total_updates}",flush=True)
     return 0
 
 if __name__=="__main__":
