@@ -323,6 +323,11 @@ def main():
         print(f"[tree-exp] building tree width={args.n} depth={args.d}", flush=True)
         print(f"[tree-exp] prompt: {text!r}", flush=True)
 
+        # Phase 1: warm up - cache base context KV states
+        print("[tree-exp] warming up KV cache for base context...", flush=True)
+        srv.query_top_n(text, n=1)  # result discarded, just caches KV
+        print("[tree-exp] KV cache warmed", flush=True)
+
         t0 = time.monotonic()
         root, stats = build_tree(srv, text, args.n, args.d)
         elapsed = time.monotonic() - t0
