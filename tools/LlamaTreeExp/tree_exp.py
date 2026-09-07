@@ -291,6 +291,8 @@ def main():
     ap.add_argument("--server", default=DEFAULT_LLAMA_SERVER, help="llama-server exe")
     ap.add_argument("--ctx-chars", type=int, default=DEFAULT_CTX_CHARS,
                     help="max prompt chars")
+    ap.add_argument("--top-n", type=int, default=10,
+                    help="show top N leaves by cumulative probability")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="show full tree and all leaves")
     args = ap.parse_args()
@@ -347,9 +349,11 @@ def main():
             print_leaves(root, file=sys.stdout)
         else:
             if leaves:
-                top = leaves[0]
-                print(f"[result] P={top.cum_prob:.6f} text={top.path_text!r}",
+                print(f"[result] top {min(args.top_n, len(leaves))} of {len(leaves)} leaves:",
                       flush=True)
+                for i, leaf in enumerate(leaves[:args.top_n], 1):
+                    print(f"  {i:2d}. P={leaf.cum_prob:.6f} {leaf.path_text!r}",
+                          flush=True)
             else:
                 print("[result] (no leaves)", flush=True)
 
