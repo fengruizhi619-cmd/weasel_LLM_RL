@@ -291,6 +291,8 @@ def main():
     ap.add_argument("--server", default=DEFAULT_LLAMA_SERVER, help="llama-server exe")
     ap.add_argument("--ctx-chars", type=int, default=DEFAULT_CTX_CHARS,
                     help="max prompt chars")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="show full tree and all leaves")
     args = ap.parse_args()
 
     text = args.text
@@ -323,16 +325,33 @@ def main():
         root, stats = build_tree(srv, text, args.n, args.d)
         elapsed = time.monotonic() - t0
 
-        print(f"\n[tree-exp] tree built in {elapsed:.2f}s, "
+        print(f"[tree-exp] tree built in {elapsed:.2f}s, "
               f"requests={stats['requests']} nodes={stats['nodes']} "
-              f"leaves={stats['leaves']}")
+              f"leaves={stats['leaves']}", flush=True)
 
-        print("\n" + "=" * 60)
-        print("CANDIDATE TREE")
-        print("=" * 60)
-        print_tree(root, file=sys.stdout)
+        # collect leaves
+        leaves = []
+        def _collect(node):
+            if node.is_leaf and not node.is_root:
+                leaves.append(node)
+            for c in node.children:
+                _collect(c)
+        _collect(root)
+        leaves.sort(key=lambda n: n.cum_prob, reverse=True)
 
-        print_leaves(root, file=sys.stdout)
+        if args.verbose:
+            print("\n" + "=" * 60, flush=True)
+            print("CANDIDATE TREE", flush=True)
+            print("=" * 60, flush=True)
+            print_tree(root, file=sys.stdout)
+            print_leaves(root, file=sys.stdout)
+        else:
+            if leaves:
+                top = leaves[0]
+                print(f"[result] P={top.cum_prob:.6f} text={top.path_text!r}",
+                      flush=True)
+            else:
+                print("[result] (no leaves)", flush=True)
 
     except Exception as e:
         print(f"[tree-exp] [ERROR] {e}", file=sys.stderr)
