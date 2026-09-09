@@ -35,6 +35,18 @@ def count_lines(path):
         return sum(1 for line in f if line.strip())
 
 
+def seen_count():
+    try:
+        with io.open(SEEN, encoding="utf-8") as f:
+            return int(f.read().strip() or 0)
+    except Exception:
+        return 0
+
+
+def pending_count():
+    return max(0, count_lines(SEGMENTS) - seen_count())
+
+
 def read_mode():
     try:
         with io.open(MODE_FILE, encoding="utf-8-sig") as f:
@@ -145,7 +157,7 @@ class Panel(tk.Tk):
 
     def refresh(self):
         self.mode_var.set(read_mode())
-        self.pending_var.set("%d 条" % count_lines(SEGMENTS))
+        self.pending_var.set("%d 条" % pending_count())
         self.trained_var.set("%d 批" % trained_batches())
         self.detect_processes()
 
@@ -178,7 +190,8 @@ class Panel(tk.Tk):
     def train(self):
         if self.proc is not None:
             return
-        pending = count_lines(SEGMENTS)
+        total = count_lines(SEGMENTS)
+        pending = pending_count()
         if pending == 0:
             messagebox.showinfo("LLM 数据面板", "当前没有待训练数据。")
             return
@@ -187,7 +200,7 @@ class Panel(tk.Tk):
                 "用这 %d 条数据训练一次？训练成功后这批样本会被丢弃。\n"
                 "训练在后台无窗口进程里跑，面板可以继续使用。" % pending):
             return
-        self.trained_lines = pending
+        self.trained_lines = total
         self.train_btn.config(state="disabled", text="训练中…")
         self.progress["maximum"] = max(1, pending)
         self.progress["value"] = 0
