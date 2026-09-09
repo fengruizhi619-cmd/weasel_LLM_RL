@@ -1,6 +1,6 @@
 @echo off
-chcp 65001 >nul
-cd /d "E:\codex_data\ç ”ç©¶\weasel-baseline\tools\LlamaTreeExp"
+chcp 936 >nul
+cd /d "E:\codex_data\ÑÐ¾¿\weasel-baseline\tools\LlamaTreeExp"
 set "MODEFILE=%APPDATA%\Rime\ghost_mode.txt"
 set "MODE=online"
 if exist "%MODEFILE%" for /f "usebackq tokens=*" %%m in ("%MODEFILE%") do set "MODE=%%m"

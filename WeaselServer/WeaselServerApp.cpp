@@ -87,7 +87,7 @@ void WeaselServerApp::SetupMenuHandlers() {
   m_server.AddMenuHandler(ID_WEASELTRAY_GHOST_PANEL, [dir] {
     std::thread th([dir]() {
       ShellExecuteW(NULL, L"open", (dir / L"ghost_data_panel.cmd").c_str(), NULL,
-                    dir.c_str(), SW_SHOWNORMAL);
+                    dir.c_str(), SW_HIDE);
     });
     th.detach();
     return 0;
