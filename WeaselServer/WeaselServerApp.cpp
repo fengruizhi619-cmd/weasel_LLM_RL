@@ -84,6 +84,14 @@ void WeaselServerApp::SetupMenuHandlers() {
     RestartGhostService();
     return 0;
   });
+  m_server.AddMenuHandler(ID_WEASELTRAY_GHOST_PANEL, [dir] {
+    std::thread th([dir]() {
+      ShellExecuteW(NULL, L"open", (dir / L"ghost_data_panel.cmd").c_str(), NULL,
+                    dir.c_str(), SW_SHOWNORMAL);
+    });
+    th.detach();
+    return 0;
+  });
   m_server.AddMenuHandler(ID_WEASELTRAY_LOGDIR,
                           std::bind(explore, WeaselLogPath()));
 }
