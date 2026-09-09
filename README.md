@@ -128,7 +128,28 @@ versions/              各版本归档 zip
 
 ### 模型
 
-放到 `<repo>/models/Qwen3-0.6B-Base`，或设置环境变量 `WEASEL_LLM_MODEL` 指向别处。
+两个东西都在 [Release](https://github.com/fengruizhi619-cmd/weasel_LLM_RL/releases) 里，不用自己找：
+
+| 资产 | 大小 | 放到哪 |
+| --- | --- | --- |
+| `Qwen3-0.6B-Base.zip.001/.002/.003` | 1.2 GB（分 3 段） | 合并解压到 `<repo>/models/Qwen3-0.6B-Base` |
+| `lm_head_t0.pt` | 622 MB | `<repo>/tools/LlamaTreeExp/diag/checkpoints_online/` |
+
+一条命令拉齐（自动下载、合并分段、解压）：
+
+```powershell
+.\install.ps1 -ModelsOnly
+```
+
+主干是 fp16、解码器是 fp32，这两块是拼合法的组成部分，**不要**换成官方原模型或别处来的权重。
+
+国内直连 GitHub 慢的话走镜像：
+
+```powershell
+.\install.ps1 -ModelsOnly -Mirror https://gh.xxooo.cf/
+```
+
+也可以自己下载后放到上面两个目录，或设置环境变量 `WEASEL_LLM_MODEL` 指向别处。
 
 ### 构建
 
@@ -152,6 +173,7 @@ build.bat
 .\install.ps1 -DryRun                                          # 只预览，不改动系统
 .\install.ps1 -RimeHome "C:\Program Files\Rime\weasel-0.17.4"  # 手动指定安装目录
 .\install.ps1 -Uninstall                                       # 恢复备份并清理
+.\install.ps1 -DownloadModels                                  # 装完顺带把模型下下来
 ```
 
 安装前建议先跑一次 `-DryRun`，确认它找对了目录。

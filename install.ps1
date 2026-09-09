@@ -7,6 +7,9 @@
     .\install.ps1 -RimeHome "C:\Program Files\Rime\weasel-0.17.4"
     .\install.ps1 -Uninstall
     .\install.ps1 -DryRun
+    .\install.ps1 -DownloadModels
+    .\install.ps1 -ModelsOnly
+    .\install.ps1 -ModelsOnly -Mirror https://gh.xxooo.cf/
 #>
 [CmdletBinding()]
 param(
@@ -14,7 +17,10 @@ param(
     [string]$Source = "",
     [switch]$Uninstall,
     [switch]$SkipRegistry,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$DownloadModels,
+    [switch]$ModelsOnly,
+    [string]$Mirror = ""
 )
 
 $ErrorActionPreference = 'Stop'
@@ -70,14 +76,88 @@ function Start-Weasel([string]$RimeDir) {
     if (Test-Path $exe) { Start-Process -FilePath $exe -WindowStyle Hidden }
 }
 
+$ReleaseTag  = 'cli_emojiless_RL_v1.2'
+$ReleaseBase = 'https://github.com/fengruizhi619-cmd/weasel_LLM_RL/releases/download/' + $ReleaseTag + '/'
+$ModelParts  = @('Qwen3-0.6B-Base.zip.001', 'Qwen3-0.6B-Base.zip.002', 'Qwen3-0.6B-Base.zip.003')
+$HeadAsset   = 'lm_head_t0.pt'
+
+function Get-MirrorBase {
+    if ($Mirror) { return $Mirror }
+    if ($env:WEASEL_LLM_MIRROR) { return $env:WEASEL_LLM_MIRROR }
+    return ''
+}
+
+function Get-RemoteFile([string]$Name, [string]$Dest) {
+    $url = $ReleaseBase + $Name
+    $mb = Get-MirrorBase
+    if ($mb) {
+        if (-not $mb.EndsWith('/')) { $mb += '/' }
+        $url = $mb + $url
+    }
+    Step ("下载 " + $Name)
+    if (Get-Command curl.exe -ErrorAction SilentlyContinue) {
+        & curl.exe -L --fail --retry 3 --retry-delay 3 -o "$Dest" "$url" -w "    http=%{http_code} size=%{size_download} speed=%{speed_download}`n"
+        if ($LASTEXITCODE -ne 0) { throw ("下载失败: " + $url) }
+    } else {
+        $old = $ProgressPreference
+        $ProgressPreference = 'SilentlyContinue'
+        try { Invoke-WebRequest -Uri $url -OutFile $Dest -UseBasicParsing }
+        finally { $ProgressPreference = $old }
+    }
+}
+
+function Install-Models {
+    $modelDir = Join-Path $RepoRoot 'models\Qwen3-0.6B-Base'
+    $headDir  = Join-Path $RepoRoot 'tools\LlamaTreeExp\diag\checkpoints_online'
+    $tmp      = Join-Path $RepoRoot 'models\_download'
+    foreach ($d in @($modelDir, $headDir, $tmp)) {
+        if (-not (Test-Path $d)) { New-Item -ItemType Directory -Path $d -Force | Out-Null }
+    }
+
+    if (Test-Path (Join-Path $modelDir 'model.safetensors')) {
+        Step "主干已存在，跳过"
+    } else {
+        foreach ($part in $ModelParts) { Get-RemoteFile $part (Join-Path $tmp $part) }
+        $zip = Join-Path $tmp 'Qwen3-0.6B-Base.zip'
+        Step "合并分段"
+        $out = [IO.File]::Create($zip)
+        try {
+            foreach ($part in $ModelParts) {
+                $in = [IO.File]::OpenRead((Join-Path $tmp $part))
+                try { $in.CopyTo($out) } finally { $in.Close() }
+            }
+        } finally { $out.Close() }
+        Step "解压到 models\Qwen3-0.6B-Base"
+        Expand-Archive -LiteralPath $zip -DestinationPath $modelDir -Force
+        Remove-Item -LiteralPath $tmp -Recurse -Force
+    }
+
+    $head = Join-Path $headDir $HeadAsset
+    if (Test-Path $head) {
+        Step "解码器已存在，跳过"
+    } else {
+        Get-RemoteFile $HeadAsset $head
+    }
+}
+
 # --- elevate unless we are only previewing ---
-if (-not $DryRun -and -not (Test-Admin)) {
+if (-not $DryRun -and -not $ModelsOnly -and -not (Test-Admin)) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$PSCommandPath`"")
     if ($RimeHome) { $argList += @('-RimeHome', "`"$RimeHome`"") }
     if ($Source)   { $argList += @('-Source', "`"$Source`"") }
     if ($Uninstall) { $argList += '-Uninstall' }
     if ($SkipRegistry) { $argList += '-SkipRegistry' }
+    if ($DownloadModels) { $argList += '-DownloadModels' }
+    if ($ModelsOnly) { $argList += '-ModelsOnly' }
+    if ($Mirror) { $argList += @('-Mirror', "`"$Mirror`"") }
     Start-Process powershell -Verb RunAs -ArgumentList $argList
+    exit 0
+}
+
+if ($ModelsOnly) {
+    Say "仅下载模型（不安装输入法）"
+    if (-not $DryRun) { Install-Models }
+    Say "完成。"
     exit 0
 }
 
@@ -175,10 +255,25 @@ if (-not $SkipRegistry) {
     Say "6/6 跳过注册表"
 }
 
+if ($DownloadModels) {
+    Say "7/7 下载模型（主干 + 解码器，约 1.8GB）"
+    if (-not $DryRun) { Install-Models }
+}
+
 if (-not $DryRun) { Start-Weasel $RimeDir }
 
 Say ""
 Say "安装完成。接下来："
-Say ("  1. 把 Qwen3-0.6B-Base 放到 " + $RepoRoot + "\models\Qwen3-0.6B-Base")
-Say "     （或设置环境变量 WEASEL_LLM_MODEL 指向别处）"
-Say "  2. 在任意输入框打字验证；模式切换见 README"
+if (Test-Path (Join-Path $RepoRoot 'models\Qwen3-0.6B-Base\model.safetensors')) {
+    Say "  - 主干已就位: models\Qwen3-0.6B-Base"
+} else {
+    Say "  - 主干未就位，运行 .\install.ps1 -ModelsOnly 下载（约 1.8GB）"
+    Say ("    或手动放到 " + $RepoRoot + "\models\Qwen3-0.6B-Base")
+}
+if (Test-Path (Join-Path $RepoRoot 'tools\LlamaTreeExp\diag\checkpoints_online\lm_head_t0.pt')) {
+    Say "  - 解码器已就位: tools\LlamaTreeExp\diag\checkpoints_online\lm_head_t0.pt"
+} else {
+    Say "  - 解码器未就位，运行 .\install.ps1 -ModelsOnly 下载"
+}
+Say "  - 在任意输入框打字验证；模式切换见 README"
+Say "  - 下载慢时可加 -Mirror https://gh.xxooo.cf/ 走镜像"
