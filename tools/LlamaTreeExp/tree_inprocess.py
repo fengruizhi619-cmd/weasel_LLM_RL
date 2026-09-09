@@ -7,7 +7,10 @@ import argparse, math, os, sys, time, unicodedata
 import numpy as np
 from llama_cpp import Llama
 
-DEFAULT_MODEL = r"E:\llama.cpp\models\Qwen3-0.6B-Base-Q8_0.gguf"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+DEFAULT_MODEL = (os.environ.get("WEASEL_LLM_GGUF", "").strip()
+                 or os.path.join(_REPO_ROOT, "models", "Qwen3-0.6B-Base-Q8_0.gguf"))
 DEFAULT_WIDTH = 5
 DEFAULT_DEPTH = 5
 DEFAULT_CTX_CHARS = 100

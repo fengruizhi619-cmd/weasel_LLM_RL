@@ -24,7 +24,7 @@ SEEN = os.path.join(HERE, "diag", "segments.seen")
 STATS = os.path.join(HERE, "diag", "train_stats.jsonl")
 MODE_FILE = os.path.join(os.environ.get("APPDATA", ""), "Rime", "ghost_mode.txt")
 TRAIN = os.path.join(HERE, "offline_train.py")
-PYTHON = r"E:\python\python.exe"
+PYTHON = os.environ.get("WEASEL_LLM_PYTHON", "").strip() or "python.exe"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 

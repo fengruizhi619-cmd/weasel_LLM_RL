@@ -1,2 +1,4 @@
+Set fso = CreateObject("Scripting.FileSystemObject")
 Set sh = CreateObject("WScript.Shell")
-sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File ""E:\codex_data\研究\weasel-baseline\tools\LlamaTreeExp\watchdog.ps1""", 0, False
+ps1 = fso.BuildPath(fso.GetParentFolderName(WScript.ScriptFullName), "watchdog.ps1")
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File """ & ps1 & """", 0, False

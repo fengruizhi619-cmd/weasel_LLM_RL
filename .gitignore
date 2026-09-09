@@ -61,3 +61,8 @@ arm64x_wrapper/*.exp
 tools/LlamaTreeExp/diag/
 tools/LlamaTreeExp/__pycache__/
 **/__pycache__/
+
+# local runtime data (never commit)
+models/
+llama.cpp/
+ghost_home.txt

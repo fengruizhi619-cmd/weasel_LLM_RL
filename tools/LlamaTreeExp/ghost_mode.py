@@ -19,7 +19,26 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODE_FILE = os.path.join(os.environ.get("APPDATA", ""), "Rime", "ghost_mode.txt")
-WEASEL_SERVER = r"C:\Program Files\Rime\weasel-0.17.4-emoji-off\WeaselServer.exe"
+def _weasel_server():
+    """Locate WeaselServer.exe: env override, then the registered TSF dll dir."""
+    value = os.environ.get("WEASEL_SERVER", "").strip()
+    if value:
+        return value
+    try:
+        import winreg
+        sub = (r"SOFTWARE\Classes\CLSID\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}"
+               r"\InprocServer32")
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, sub) as key:
+            dll, _ = winreg.QueryValueEx(key, "")
+        if dll:
+            return os.path.join(os.path.dirname(dll), "WeaselServer.exe")
+    except Exception:
+        pass
+    return ""
+
+
+WEASEL_SERVER = _weasel_server()
+PYTHONW = os.environ.get("WEASEL_LLM_PYTHONW", "").strip() or "pythonw.exe"
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -101,7 +120,7 @@ def weasel_pids():
 def start_recorder():
     """The segment recorder is background collection: it must survive mode
     switches and run for every input method."""
-    cmd = [r"E:\python\pythonw.exe", os.path.join(HERE, "offline_recorder.py"),
+    cmd = [PYTHONW, os.path.join(HERE, "offline_recorder.py"),
            "--log-file", os.path.join(HERE, "diag", "exp-run-v02.log"),
            "--out", os.path.join(HERE, "diag", "segments.jsonl")]
     subprocess.Popen(cmd, cwd=HERE, close_fds=True,

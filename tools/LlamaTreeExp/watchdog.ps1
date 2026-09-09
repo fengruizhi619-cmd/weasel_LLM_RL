@@ -1,13 +1,21 @@
 ﻿# watchdog.ps1 - keep the online chain alive
 $ErrorActionPreference = 'Continue'
-$base = 'E:\codex_data\研究\weasel-baseline'
+$base = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $exp = Join-Path $base 'tools\LlamaTreeExp'
 $diag = Join-Path $exp 'diag'
 $log = Join-Path $diag 'watchdog.log'
+$pythonw = if ($env:WEASEL_LLM_PYTHONW) { $env:WEASEL_LLM_PYTHONW } else { 'pythonw.exe' }
 New-Item -ItemType Directory -Force -Path $diag | Out-Null
 function Note([string]$m) { Add-Content -LiteralPath $log -Value ((Get-Date -Format 'MM-dd HH:mm:ss') + ' ' + $m) -Encoding UTF8 }
 if (-not (Get-Process WeaselServer -ErrorAction SilentlyContinue)) {
-  $exe = 'C:\Program Files\Rime\weasel-0.17.4-emoji-off\WeaselServer.exe'
+  $weaselHome = $env:WEASEL_HOME
+  if (-not $weaselHome) {
+    try {
+      $dll = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Classes\CLSID\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}\InprocServer32' -ErrorAction Stop).'(default)'
+      if ($dll) { $weaselHome = Split-Path -Parent $dll }
+    } catch {}
+  }
+  $exe = if ($weaselHome) { Join-Path $weaselHome 'WeaselServer.exe' } else { '' }
   if (Test-Path $exe) { Start-Process -FilePath $exe -WindowStyle Hidden; Note 'started WeaselServer' }
 }
 if (-not (Get-Process WeaselExpContextV0 -ErrorAction SilentlyContinue)) {
@@ -31,6 +39,6 @@ if (Test-Path $lock) {
 $recProc = Get-CimInstance Win32_Process -Filter "Name like '%python%'" | Where-Object { $_.CommandLine -like '*offline_recorder.py*' }
 if (-not $recAlive -and -not $recProc) {
   $rargs = @((Join-Path $exp 'offline_recorder.py'), '--log-file', (Join-Path $diag 'exp-run-v02.log'), '--out', (Join-Path $diag 'segments.jsonl'))
-  Start-Process -FilePath 'E:\python\pythonw.exe' -ArgumentList $rargs -WorkingDirectory $exp -WindowStyle Hidden
+  Start-Process -FilePath $pythonw -ArgumentList $rargs -WorkingDirectory $exp -WindowStyle Hidden
   Note 'started background segment recorder'
 }

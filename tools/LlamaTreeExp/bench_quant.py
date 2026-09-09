@@ -7,7 +7,10 @@ import torch.nn.functional as F
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_PATH = r"E:\codex_data\研究\models\Qwen3-0.6B-Base"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+MODEL_PATH = (os.environ.get("WEASEL_LLM_MODEL", "").strip()
+              or os.path.join(_REPO_ROOT, "models", "Qwen3-0.6B-Base"))
 DEVICE = "cuda"
 PROMPT = "明天天气如何，是"
 LR = 1e-4

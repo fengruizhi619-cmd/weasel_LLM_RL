@@ -6,7 +6,10 @@ import ctypes, ctypes.wintypes, os, sys, time, unicodedata
 import numpy as np
 
 # [CT-001 DLL]
-DLL_PATH = r"E:\llama.cpp\llama.dll"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+DLL_PATH = (os.environ.get("WEASEL_LLM_DLL", "").strip()
+            or os.path.join(_REPO_ROOT, "llama.cpp", "llama.dll"))
 llama = ctypes.CDLL(DLL_PATH)
 
 # C types
@@ -206,7 +209,8 @@ class LlamaTreeBuilder:
 # [CT-005 DEMO]
 def main():
     import math
-    model_path = r"E:\llama.cpp\models\Qwen3-0.6B-Base-Q8_0.gguf"
+    model_path = (os.environ.get("WEASEL_LLM_GGUF", "").strip()
+                  or os.path.join(_REPO_ROOT, "models", "Qwen3-0.6B-Base-Q8_0.gguf"))
 
     print("[tree] loading model...")
     builder = LlamaTreeBuilder(model_path, ctx_size=1024)

@@ -11,11 +11,15 @@ import argparse, json, math, os, re, sys, time, unicodedata
 import numpy as np
 import requests
 
-DEFAULT_MODEL = r"E:\llama.cpp\models\Qwen3-0.6B-Base-Q8_0.gguf"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+DEFAULT_MODEL = (os.environ.get("WEASEL_LLM_GGUF", "").strip()
+                or os.path.join(_REPO_ROOT, "models", "Qwen3-0.6B-Base-Q8_0.gguf"))
 # HF directory (safetensors + tokenizer) for the PyTorch RL side; the GGUF
 # above is used by llama.cpp for tree building. They must be passed separately:
 # transformers cannot from_pretrained() a bare .gguf path.
-DEFAULT_HF_MODEL = r"E:\codex_data\研究\models\Qwen3-0.6B-Base"
+DEFAULT_HF_MODEL = (os.environ.get("WEASEL_LLM_MODEL", "").strip()
+              or os.path.join(_REPO_ROOT, "models", "Qwen3-0.6B-Base"))
 WIDTH = 5
 DEPTH = 5
 TOP_N = 10

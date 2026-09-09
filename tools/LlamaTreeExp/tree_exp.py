@@ -31,8 +31,12 @@ except ImportError:
 
 # ---------------------------------------------------------------- constants
 
-DEFAULT_LLAMA_SERVER = r"E:\llama.cpp\llama-server.exe"
-DEFAULT_MODEL = r"E:\llama.cpp\models\Qwen3-0.6B-Base-Q8_0.gguf"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+DEFAULT_LLAMA_SERVER = (os.environ.get("WEASEL_LLM_SERVER", "").strip()
+                       or os.path.join(_REPO_ROOT, "llama.cpp", "llama-server.exe"))
+DEFAULT_MODEL = (os.environ.get("WEASEL_LLM_GGUF", "").strip()
+                 or os.path.join(_REPO_ROOT, "models", "Qwen3-0.6B-Base-Q8_0.gguf"))
 DEFAULT_WIDTH = 5
 DEFAULT_DEPTH = 5
 DEFAULT_CTX_CHARS = 100

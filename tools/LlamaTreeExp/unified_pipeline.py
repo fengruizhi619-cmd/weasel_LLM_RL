@@ -15,7 +15,10 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache, DynamicLayer
 
-MODEL_PATH = r"E:\codex_data\研究\models\Qwen3-0.6B-Base"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(_HERE))
+MODEL_PATH = (os.environ.get("WEASEL_LLM_MODEL", "").strip()
+              or os.path.join(_REPO_ROOT, "models", "Qwen3-0.6B-Base"))
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 LR = 1e-4
 WIDTH = 5
