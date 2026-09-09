@@ -55,3 +55,40 @@ stop-online.cmd      停引擎和钩子，WeaselServer 保持运行
 - 触发时机：引擎轮询 `/metrics` 的 accept_rate 自适应空闲阈值（400/800/1200ms）；上下文 < 2 字不预测。
 - 延迟结论：FP8 更慢、fp16 头无收益、Windows 无 Triton；有效的是 logits LRU + token 缓存。
 - `--prefetch` 默认关闭：预取会占模型锁，墙钟时间不变。
+
+## 离线记录模式（无推理、无训练）
+
+```
+python ghost_mode.py status     # 看当前模式与进程
+python ghost_mode.py offline    # 切到离线记录：停引擎、起记录器
+python ghost_mode.py online     # 切回在线推理：停记录器、起引擎
+```
+
+模式文件：`%APPDATA%\Rime\ghost_mode.txt`（内容 `online` / `offline`）。
+WeaselServer 启动时由 `ghost_service.cmd` 读它决定托管哪个进程；IME 侧（v18+）
+读到 offline 就完全不再请求预测。
+
+离线记录内容：`diag/segments.jsonl`，每条是「上下文 + 一个提交断点」，
+例如「你吃饭了吗」会记成
+
+```
+ctx=""        segment="你"
+ctx="你"      segment="吃饭"
+ctx="你吃饭"  segment="了"
+ctx="你吃饭了" segment="吗"
+```
+
+回退另记 `kind="backspace"`（被删掉的文本），替换记 `kind="replace"`。
+同一个加密格式（AES-256-GCM），可用 `decrypt_corpus.py` 审计。
+
+离线训练：
+
+```
+python offline_train.py                 # 训练 segments.jsonl 里的新记录
+python offline_train.py --dry-run       # 只看命中率/奖励，不更新
+python offline_train.py --epochs 3
+```
+
+训练方法与在线完全一致：从 ctx 建候选树 → `reward = 叶子cum × 字符匹配比例`
+→ 对 lm_head 做一步 SGD；回退用 unlikelihood。checkpoint 共用同一套五槽，
+在线/离线是同一条权重血脉。

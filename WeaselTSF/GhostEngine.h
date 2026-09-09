@@ -699,11 +699,38 @@ class Engine {
     return L"http://127.0.0.1:8081/completion";
   }
 
+  // [MODE-001] Offline recording mode: the IME must not ask for predictions.
+  // The switch is a small file, re-read every 3 seconds.
+  static bool OfflineMode() {
+    static std::atomic<long long> checked{0};
+    static std::atomic<bool> offline{false};
+    const long long now = static_cast<long long>(GetTickCount64());
+    if (now - checked.load(std::memory_order_relaxed) > 3000) {
+      bool value = false;
+      wchar_t path[MAX_PATH]{};
+      ExpandEnvironmentStringsW(L"%APPDATA%\\Rime\\ghost_mode.txt", path,
+                                MAX_PATH);
+      FILE* file = nullptr;
+      if (_wfopen_s(&file, path, L"r,ccs=UTF-8") == 0 && file) {
+        wchar_t buffer[32]{};
+        if (fgetws(buffer, static_cast<int>(std::size(buffer)), file) &&
+            _wcsnicmp(buffer, L"offline", 7) == 0)
+          value = true;
+        fclose(file);
+      }
+      offline.store(value, std::memory_order_relaxed);
+      checked.store(now, std::memory_order_relaxed);
+    }
+    return offline.load(std::memory_order_relaxed);
+  }
+
   static bool Enabled() {
     wchar_t value[8]{};
     DWORD size = GetEnvironmentVariableW(L"WEASEL_GHOST_DISABLE", value,
                                          static_cast<DWORD>(std::size(value)));
-    return !(size > 0 && size < std::size(value) && wcscmp(value, L"1") == 0);
+    if (size > 0 && size < std::size(value) && wcscmp(value, L"1") == 0)
+      return false;
+    return !OfflineMode();
   }
 
   bool VisibleLocked() const { return !visible_text_.empty(); }

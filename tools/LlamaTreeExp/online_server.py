@@ -17,6 +17,7 @@ Extra request field
 """
 import argparse
 import base64
+import io
 import queue
 from collections import OrderedDict
 from concurrent.futures import Future
@@ -38,6 +39,7 @@ import torch.nn.functional as F
 
 torch.set_float32_matmul_precision("high")
 
+from corpus import CorpusWriter
 import unified_pipeline as up
 import unified_watcher as uw
 
@@ -225,62 +227,6 @@ class Metrics:
                         self.accepted_chars * self.keys_per_char / keys, 4),
                 },
             }
-
-
-class CorpusWriter:
-    """Append-only corpus, AES-256-GCM when available, XOR fallback otherwise.
-
-    Key material comes from WEASEL_CORPUS_KEY (or a key file), never from the
-    record itself. Each line is base64(nonce || ciphertext || tag).
-    """
-
-    def __init__(self, path, key=None, key_file=None):
-        self.path = path
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        seed = key or os.environ.get("WEASEL_CORPUS_KEY")
-        if not seed and key_file and os.path.exists(key_file):
-            with open(key_file, "rb") as f:
-                seed = f.read()
-        if not seed:
-            seed = ("weasel-corpus-" + os.environ.get("USERNAME", "local")).encode("utf-8")
-        if isinstance(seed, str):
-            seed = seed.encode("utf-8")
-        self.key = hashlib.sha256(seed).digest()
-        self.aead = AESGCM(self.key) if AESGCM else None
-
-    def _xor(self, data):
-        k = self.key
-        return bytes(b ^ k[i % len(k)] for i, b in enumerate(data))
-
-    def write(self, record):
-        raw = json.dumps(record, ensure_ascii=False).encode("utf-8")
-        if self.aead:
-            nonce = os.urandom(12)
-            blob = base64.b64encode(nonce + self.aead.encrypt(nonce, raw, None))
-        else:
-            blob = base64.b64encode(self._xor(raw))
-        with open(self.path, "a", encoding="utf-8") as f:
-            f.write(blob.decode("ascii") + "\n")
-
-    def read_all(self):
-        out = []
-        if not os.path.exists(self.path):
-            return out
-        with open(self.path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = base64.b64decode(line)
-                    if self.aead:
-                        raw = self.aead.decrypt(data[:12], data[12:], None)
-                    else:
-                        raw = self._xor(data)
-                    out.append(json.loads(raw.decode("utf-8")))
-                except Exception:
-                    continue
-        return out
 
 
 class EngineService:
@@ -934,6 +880,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not found"})
 
 
+def ghost_mode():
+    """Read the user-facing mode switch: %APPDATA%\\Rime\\ghost_mode.txt."""
+    path = os.path.join(os.environ.get("APPDATA", ""), "Rime", "ghost_mode.txt")
+    try:
+        with io.open(path, encoding="utf-8-sig") as f:
+            value = f.read().strip().lower()
+        if value:
+            return value
+    except Exception:
+        pass
+    return "online"
+
+
 def main():
     ap = argparse.ArgumentParser(description="online unified engine service")
     ap.add_argument("--host", default="127.0.0.1")
@@ -978,6 +937,11 @@ def main():
                     help="warm the LRU with the top-1 child (off: it holds the "
                          "model lock, so it does not reduce wall-clock latency)")
     args = ap.parse_args()
+
+    if ghost_mode() == "offline":
+        print("[S1] offline mode: the online engine stays down "
+              "(offline_recorder.py handles this mode)", flush=True)
+        return 0
 
     metrics = Metrics()
     engine = up.TreeEngine(args.model, lr=args.rl_lr, device=args.device,
