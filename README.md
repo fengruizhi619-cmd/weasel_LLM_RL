@@ -212,6 +212,7 @@ WeaselServer 启动时读取 `%APPDATA%\Rime\ghost_mode.txt`，按模式拉起�
 
 | 版本 | 说明 |
 |---|---|
+| `cli_emojiless_RL_v1.2.1` | 安装器从 Release 拉模型（`-DownloadModels` / `-ModelsOnly` / `-Mirror`） |
 | `cli_emojiless_RL_v1.2` | 数据面板、无头离线训练与进度、入口去 cmd 窗口、脚本编码修复 |
 | `cli_emojiless_RL_v1.1` | 离线记录模式、语言栏模式切换、兄弟节点批量前向 |
 | `cli_emojiless_RL_v1` | 在线 RL 引擎托管进 WeaselServer |
