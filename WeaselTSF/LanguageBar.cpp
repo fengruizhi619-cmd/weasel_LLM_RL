@@ -172,6 +172,25 @@ STDMETHODIMP CLangBarItemButton::OnClick(TfLBIClick click,
         menu = LoadMenuW(g_hInst, MAKEINTRESOURCE(IDR_MENU_POPUP));
       }
       HMENU popupMenu = GetSubMenu(menu, 0);
+      // [GHOST-SERVICE] radio-check the active LLM mode before showing
+      {
+        wchar_t mode_path[MAX_PATH] = {0};
+        ExpandEnvironmentStringsW(L"%APPDATA%\\Rime\\ghost_mode.txt",
+                                  mode_path, MAX_PATH);
+        FILE* mode_file = nullptr;
+        bool offline = false;
+        if (_wfopen_s(&mode_file, mode_path, L"r,ccs=UTF-8") == 0 && mode_file) {
+          wchar_t buffer[32] = {0};
+          if (fgetws(buffer, static_cast<int>(std::size(buffer)), mode_file) &&
+              _wcsnicmp(buffer, L"offline", 7) == 0)
+            offline = true;
+          fclose(mode_file);
+        }
+        CheckMenuRadioItem(
+            popupMenu, ID_WEASELTRAY_GHOST_ONLINE, ID_WEASELTRAY_GHOST_OFFLINE,
+            offline ? ID_WEASELTRAY_GHOST_OFFLINE : ID_WEASELTRAY_GHOST_ONLINE,
+            MF_BYCOMMAND);
+      }
       UINT wID = TrackPopupMenuEx(
           popupMenu, TPM_NONOTIFY | TPM_RETURNCMD | TPM_HORPOSANIMATION, pt.x,
           pt.y, hwnd, NULL);
