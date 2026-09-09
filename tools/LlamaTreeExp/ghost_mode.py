@@ -73,8 +73,24 @@ def engine_pids():
     return sorted(pids)
 
 
+def job_children():
+    """pythonw processes hosted by WeaselServer (their command line can be empty)."""
+    out = ps("$ws = Get-Process WeaselServer -ErrorAction SilentlyContinue | "
+             "Select-Object -First 1; if ($ws) { "
+             "$cmds = Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | "
+             "Where-Object { $_.ParentProcessId -eq $ws.Id }; "
+             "Get-CimInstance Win32_Process -Filter \"Name='pythonw.exe'\" | "
+             "Where-Object { $cmds.ProcessId -contains $_.ParentProcessId } | "
+             "ForEach-Object { $_.ProcessId } }")
+    return [int(x) for x in out if x.isdigit()]
+
+
 def recorder_pids():
-    return procs_by_cmd("offline_recorder.py")
+    pids = set(procs_by_cmd("offline_recorder.py"))
+    for pid in job_children():
+        if pid not in engine_pids():
+            pids.add(pid)
+    return sorted(pids)
 
 
 def weasel_pids():

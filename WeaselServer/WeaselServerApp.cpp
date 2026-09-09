@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "WeaselServerApp.h"
+#include "WeaselServer.h"
 #include <filesystem>
 
 WeaselServerApp::WeaselServerApp()
@@ -73,6 +74,16 @@ void WeaselServerApp::SetupMenuHandlers() {
   m_server.AddMenuHandler(ID_WEASELTRAY_INSTALLDIR, std::bind(explore, dir));
   m_server.AddMenuHandler(ID_WEASELTRAY_USERCONFIG,
                           std::bind(explore, WeaselUserDataPath()));
+  m_server.AddMenuHandler(ID_WEASELTRAY_GHOST_ONLINE, [this] {
+    SetGhostMode(L"online");
+    RestartGhostService();
+    return 0;
+  });
+  m_server.AddMenuHandler(ID_WEASELTRAY_GHOST_OFFLINE, [this] {
+    SetGhostMode(L"offline");
+    RestartGhostService();
+    return 0;
+  });
   m_server.AddMenuHandler(ID_WEASELTRAY_LOGDIR,
                           std::bind(explore, WeaselLogPath()));
 }

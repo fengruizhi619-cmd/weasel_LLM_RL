@@ -40,7 +40,7 @@ static void GhostLog(const std::wstring& message) {
   }
 }
 
-static void StartGhostService() {
+void StartGhostService() {
   std::filesystem::path dir = WeaselServerApp::install_dir();
   std::filesystem::path script = dir / L"ghost_service.cmd";
   GhostLog(L"start: dir=" + dir.wstring() + L" script=" + script.wstring());
@@ -84,11 +84,51 @@ static void StartGhostService() {
   }
 }
 
-static void StopGhostService() {
+std::wstring GhostMode() {
+  wchar_t appdata[MAX_PATH] = {0};
+  ExpandEnvironmentStringsW(L"%APPDATA%\\Rime", appdata, MAX_PATH);
+  std::wstring path = std::wstring(appdata) + L"\\ghost_mode.txt";
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"r,ccs=UTF-8") == 0 && file) {
+    wchar_t buffer[32] = {0};
+    bool ok = fgetws(buffer, static_cast<int>(std::size(buffer)), file) != nullptr;
+    fclose(file);
+    if (ok) {
+      std::wstring value(buffer);
+      while (!value.empty() &&
+             (value.back() == L'\n' || value.back() == L'\r' ||
+              value.back() == L' '))
+        value.pop_back();
+      if (!value.empty())
+        return value;
+    }
+  }
+  return L"online";
+}
+
+void SetGhostMode(const wchar_t* mode) {
+  wchar_t appdata[MAX_PATH] = {0};
+  ExpandEnvironmentStringsW(L"%APPDATA%\\Rime", appdata, MAX_PATH);
+  CreateDirectoryW(appdata, nullptr);
+  std::wstring path = std::wstring(appdata) + L"\\ghost_mode.txt";
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, path.c_str(), L"w,ccs=UTF-8") == 0 && file) {
+    fwprintf(file, L"%s\n", mode);
+    fclose(file);
+  }
+  GhostLog(L"mode set to " + std::wstring(mode));
+}
+
+void StopGhostService() {
   if (g_ghost_job) {
     CloseHandle(g_ghost_job);
     g_ghost_job = NULL;
   }
+}
+
+void RestartGhostService() {
+  StopGhostService();
+  StartGhostService();
 }
 
 int WINAPI _tWinMain(HINSTANCE hInstance,

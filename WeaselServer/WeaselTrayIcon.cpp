@@ -1,5 +1,6 @@
 ﻿#include "stdafx.h"
 #include "WeaselTrayIcon.h"
+#include "WeaselServer.h"
 #include <atlstr.h>
 
 // nasty
@@ -17,7 +18,13 @@ WeaselTrayIcon::WeaselTrayIcon(weasel::UI& ui)
       m_schema_ascii_icon(),
       m_disabled(false) {}
 
-void WeaselTrayIcon::CustomizeMenu(HMENU hMenu) {}
+void WeaselTrayIcon::CustomizeMenu(HMENU hMenu) {
+  // [GHOST-SERVICE] radio-check the active LLM mode
+  UINT active = GhostMode() == L"offline" ? ID_WEASELTRAY_GHOST_OFFLINE
+                                          : ID_WEASELTRAY_GHOST_ONLINE;
+  ::CheckMenuRadioItem(hMenu, ID_WEASELTRAY_GHOST_ONLINE,
+                       ID_WEASELTRAY_GHOST_OFFLINE, active, MF_BYCOMMAND);
+}
 
 BOOL WeaselTrayIcon::Create(HWND hTargetWnd) {
   HMODULE hModule = GetModuleHandle(NULL);
