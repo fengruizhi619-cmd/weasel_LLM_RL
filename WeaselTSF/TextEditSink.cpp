@@ -20,6 +20,7 @@ static BOOL IsRangeCovered(TfEditCookie ec,
 STDMETHODIMP WeaselTSF::OnEndEdit(ITfContext* pContext,
                                   TfEditCookie ecReadOnly,
                                   ITfEditRecord* pEditRecord) {
+  _UpdateGhostSnapshot(pContext, ecReadOnly);
   BOOL fSelectionChanged;
   IEnumTfRanges* pEnumTextChanges;
   ITfRange* pRange;

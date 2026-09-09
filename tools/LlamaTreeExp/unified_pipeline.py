@@ -259,6 +259,11 @@ class TreeEngine:
                     child, keep = add_child(parent, tid, p)
                     if child is not None and keep:
                         next_growing.append((child, tid, row))
+            # [TREE-013] beam cap: keep the |width| highest-cum branches per
+            # level, otherwise width^depth explodes (20^10 nodes).
+            if len(next_growing) > width:
+                next_growing.sort(key=lambda item: item[0].cum, reverse=True)
+                next_growing = next_growing[:width]
             growing = next_growing
 
         elapsed = time.monotonic() - t0
@@ -272,7 +277,7 @@ class TreeEngine:
         stats["time"] = elapsed
         return root, leaves, stats
 
-    def rl_update(self, context_text, typed_text, reward):
+    def rl_update(self, context_text, typed_text, reward, grad_clip=0.0):
         """RL update: reinforce the model for producing typed_text after context_text.
         Zero-cost: caches hidden state, only lm_head gets gradient."""
         input_ids = self.tokenizer.encode(context_text, return_tensors="pt").to(self.device)
@@ -295,15 +300,55 @@ class TreeEngine:
         loss = -reward * log_probs[target_ids[0]]
         self.optimizer.zero_grad()
         loss.backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [self.model.lm_head.weight], grad_clip)
         self.optimizer.step()
         self.model.eval()
         return loss.item()
 
-    def save_checkpoint(self, path, updates=0):
-        w = self.model.lm_head.weight.data.cpu().half()
-        torch.save({"lm_head_weight": w, "updates": updates,
+    def rl_update_unlikelihood(self, context_text, rejected_text, weight=1.0,
+                               grad_clip=0.0):
+        """S2: negative sample -- push DOWN the probability of the rejected text.
+
+        Same zero-cost shape as rl_update: frozen backbone, cached hidden,
+        one backward through the fp32 head only.
+        """
+        input_ids = self.tokenizer.encode(context_text, return_tensors="pt").to(self.device)
+        with torch.no_grad():
+            hidden = self.model.model(
+                input_ids=input_ids).last_hidden_state[0, -1, :]
+            if hidden.dtype != torch.float32:
+                hidden = hidden.to(self.model.lm_head.weight.dtype)
+        target_ids = self.tokenizer.encode(rejected_text, add_special_tokens=False)
+        if not target_ids:
+            return 0.0
+        self.model.train()
+        logits = self.model.lm_head(hidden)
+        log_probs = F.log_softmax(logits, dim=-1)
+        # minimising log p(rejected) == gradient ascent on the negative likelihood
+        loss = weight * log_probs[target_ids[0]]
+        self.optimizer.zero_grad()
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(
+                [self.model.lm_head.weight], grad_clip)
+        self.optimizer.step()
+        self.model.eval()
+        return loss.item()
+
+    def save_checkpoint(self, path, updates=0, dtype="float32", lock=None):
+        """P1-5: keep the master head in fp32; P1-8: copy under the engine lock."""
+        target = torch.float16 if dtype == "float16" else torch.float32
+        if lock is not None:
+            with lock:
+                w = self.model.lm_head.weight.detach().to(target).cpu().clone()
+        else:
+            w = self.model.lm_head.weight.detach().to(target).cpu().clone()
+        torch.save({"lm_head_weight": w, "updates": updates, "dtype": dtype,
                     "timestamp": time.strftime("%Y%m%d_%H%M%S")}, path)
-        print(f"[engine] checkpoint saved to {path} updates={updates}")
+        print(f"[engine] checkpoint saved to {path} updates={updates} "
+              f"dtype={dtype}")
 
     def load_checkpoint(self, path):
         if not os.path.exists(path): return False

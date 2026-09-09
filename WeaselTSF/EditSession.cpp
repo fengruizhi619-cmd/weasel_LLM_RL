@@ -35,6 +35,7 @@ STDMETHODIMP WeaselTSF::DoEditSession(TfEditCookie ec) {
       _EndComposition(_pEditSessionContext, false, !_status.composing);
       compositionEnded = true;
       _committed = TRUE;
+      _expSnapshotPending = TRUE;
     } else {
       _committed = FALSE;
     }

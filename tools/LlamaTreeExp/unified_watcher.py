@@ -54,33 +54,43 @@ def find_best_reward(root, typed_text):
 
 
 class CheckpointManager:
-    def __init__(self, engine, ckpt_dir):
+    def __init__(self, engine, ckpt_dir, ckpt_dtype="float32"):
         self.engine = engine
         self.ckpt_dir = ckpt_dir
+        self.ckpt_dtype = ckpt_dtype
         self.dirty = False
         self.updates = 0
         self.last_save = {}
         os.makedirs(ckpt_dir, exist_ok=True)
 
     def load_latest(self):
+        """P1-6: pick the slot with the highest update count, not the first hit."""
         import torch
-        names = [name for name, _ in SLOTS]
-        for name in names:
+        best = None
+        for name, _ in SLOTS:
             path = os.path.join(self.ckpt_dir, name)
-            if self.engine.load_checkpoint(path):
-                try:
-                    ckpt = torch.load(path, map_location=self.engine.device)
-                    self.updates = int(ckpt.get("updates", 0))
-                except Exception:
-                    self.updates = 0
-                return True
-        return False
+            if not os.path.exists(path):
+                continue
+            try:
+                meta = torch.load(path, map_location="cpu", mmap=True,
+                                  weights_only=False)
+                key = (int(meta.get("updates", 0)), str(meta.get("timestamp", "")))
+            except Exception:
+                continue
+            if best is None or key > best[0]:
+                best = (key, path)
+        if best is None:
+            return False
+        if not self.engine.load_checkpoint(best[1]):
+            return False
+        self.updates = best[0][0]
+        return True
 
     def mark_dirty(self):
         self.dirty = True
         self.updates += 1
 
-    def save_epoch(self, force=False):
+    def save_epoch(self, force=False, lock=None):
         if not self.dirty:
             return
         now = time.time()
@@ -88,7 +98,8 @@ class CheckpointManager:
             last = self.last_save.get(name, 0.0)
             if force or (now - last) >= interval:
                 self.engine.save_checkpoint(
-                    os.path.join(self.ckpt_dir, name), updates=self.updates)
+                    os.path.join(self.ckpt_dir, name), updates=self.updates,
+                    dtype=self.ckpt_dtype, lock=lock)
                 self.last_save[name] = now
         self.dirty = False
 

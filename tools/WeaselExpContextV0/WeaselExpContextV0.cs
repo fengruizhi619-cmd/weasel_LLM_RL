@@ -65,7 +65,10 @@ internal static class Native {
 
 // [EXP-002 HOOK-CONTEXT-READER]
 internal static class Program {
-  private static int _maxChars = 100;
+  private static int _maxChars = 256;
+  // [EXP-007] when set, also capture contexts that end in ASCII (English
+  // typing). Off by default: with an IME active those are pinyin preedits.
+  private static bool _asciiMode = false;
   private static string _logPath = "";
   private static StreamWriter _log;
   private static string _diagPath = "";
@@ -141,7 +144,8 @@ internal static class Program {
   // [EXP-003 ENTRY]
   [STAThread]
   private static int Main(string[] args) {
-    Console.OutputEncoding = Encoding.UTF8;
+    // winexe build has no console: setting the encoding would throw.
+    try { Console.OutputEncoding = Encoding.UTF8; } catch { }
     for (int i = 0; i < args.Length; i++) {
       if (args[i] == "-selftest" || args[i] == "--selftest") {
         SelfTest();
@@ -159,7 +163,7 @@ internal static class Program {
       _diag = new StreamWriter(_diagPath, true, new UTF8Encoding(false));
       _diag.AutoFlush = true;
     }
-    Console.CancelKeyPress += delegate { _running = false; Native.PostThreadMessageW(Native.GetCurrentThreadId(), Native.WM_QUIT, IntPtr.Zero, IntPtr.Zero); };
+    try { Console.CancelKeyPress += delegate { _running = false; Native.PostThreadMessageW(Native.GetCurrentThreadId(), Native.WM_QUIT, IntPtr.Zero, IntPtr.Zero); }; } catch { }
 
     _keyProc = KeyboardProc;
     _hook = Native.SetWindowsHookExW(Native.WH_KEYBOARD_LL, _keyProc, Native.GetModuleHandleW(null), 0);
@@ -204,6 +208,8 @@ internal static class Program {
       } else if ((args[i] == "-diag" || args[i] == "--diag") && i + 1 < args.Length) {
         _diagPath = args[i + 1];
         i++;
+      } else if (args[i] == "-ascii" || args[i] == "--ascii") {
+        _asciiMode = true;
       }
     }
   }
@@ -355,24 +361,28 @@ internal static class Program {
     // [EXP-006] commit-only trigger: while IME composition is live the
     // pre-caret text ends with ASCII pinyin letters; only when the candidate
     // is committed onto the document does a non-ASCII (CJK/punct) tail
-    // appear. Treat that as the sole "上屏" trigger.
-    if (trimmed.Length == 0 || IsAsciiLetter(trimmed[trimmed.Length - 1])) return;
+    // appear. Treat that as the sole "上屏" trigger, unless -ascii is given.
+    if (trimmed.Length == 0) return;
+    bool asciiTail = IsAsciiLetter(trimmed[trimmed.Length - 1]);
+    if (asciiTail && !_asciiMode) return;
     string stripped = Regex.Replace(trimmed, "[A-Za-z]+$", "").TrimEnd();
     if (string.IsNullOrWhiteSpace(stripped)) return;
     string keyed = (DateTime.Now - _lastKey).TotalMilliseconds <= 2500 ? "key" : "other";
 
+    int delta;
     lock (_gate) {
-      // Forward-typing gate: log only when the context strictly grows versus
-      // the previous state. This drops backspace cascades and duplicate
-      // text+trailing-space events from the same commit.
-      if (_hasPrev && stripped.Length <= _prevLen) return;
+      // [EXP-007] record every change, including backspaces and replacements.
+      // The RL side classifies them (predicted-reject / typing-reject /
+      // replace); dropping them here silently removed all negative samples.
+      if (_lastLogged != null && _lastLogged == stripped) return;
+      delta = _hasPrev ? stripped.Length - _prevLen : 0;
       _hasPrev = true;
       _prevLen = stripped.Length;
-      if (_lastLogged != null && _lastLogged == stripped) return;
       _lastLogged = stripped;
     }
 
     string line = "[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] src=" + keyed +
+                  (asciiTail ? "/ascii" : "") + " delta=" + (delta >= 0 ? "+" : "") + delta +
                   " rebuild=yes ctx(" + stripped.Length + "/" + _maxChars + "): " + stripped;
     LogLine(line);
     AppendDiag("[" + DateTime.Now.ToString("HH:mm:ss.fff") + "] rawN=" + rawContext.Length +

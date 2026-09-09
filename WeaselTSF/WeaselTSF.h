@@ -4,6 +4,8 @@
 #include <WeaselIPC.h>
 #include <WeaselIPCData.h>
 
+namespace weasel { namespace ghost { class Engine; } }
+
 class CCandidateList;
 class CLangBarItemButton;
 class CCompartmentEventSink;
@@ -169,6 +171,7 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   DWORD _dwThreadFocusSinkCookie;
 
   BOOL _InitTextEditSink(com_ptr<ITfDocumentMgr> pDocMgr);
+  void _UpdateGhostSnapshot(ITfContext* pContext, TfEditCookie ecReadOnly);
 
   BOOL _InitKeyEventSink();
   void _UninitKeyEventSink();
@@ -184,6 +187,15 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   void _EnableLanguageBar(BOOL enable);
 
   BOOL _InsertText(com_ptr<ITfContext> pContext, const std::wstring& ext);
+ public:
+  std::wstring _GetGhostPrediction();
+  void _SetGhostPreedit(const std::wstring& preedit);
+  bool _HasGhostPrediction();
+  void _HideGhostPrediction();
+ private:
+
+  BOOL _CommitPrediction(com_ptr<ITfContext> pContext, const std::wstring& text);
+  bool _TryCommitPrediction(ITfContext* pContext, WPARAM wParam, BOOL* pfEaten);
 
   void _DeleteCandidateList();
 
@@ -230,6 +242,10 @@ class WeaselTSF : public ITfTextInputProcessorEx,
 
   /* IME status */
   weasel::Status _status;
+
+  /* LLM ghost prediction engine (in-process, talks to local llama-server) */
+  std::unique_ptr<weasel::ghost::Engine> m_ghostEngine;
+  BOOL _expSnapshotPending = FALSE;
 
   // guidatom for the display attibute.
   TfGuidAtom _gaDisplayAttributeInput;

@@ -23,3 +23,5 @@
 
 template<typename I>
 using com_ptr = CComPtr<I>;
+
+#include "LlmLog.h"

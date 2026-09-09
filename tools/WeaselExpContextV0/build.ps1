@@ -18,6 +18,6 @@ function Get-GacDll($name) {
 $refUiaClient = Get-GacDll 'UIAutomationClient'
 $refUiaTypes = Get-GacDll 'UIAutomationTypes'
 $refWinBase = Get-GacDll 'WindowsBase'
-& $csc /nologo /target:exe /out:$out /r:$refUiaClient /r:$refUiaTypes /r:$refWinBase $src
+& $csc /nologo /target:winexe /out:$out /r:$refUiaClient /r:$refUiaTypes /r:$refWinBase $src
 if ($LASTEXITCODE -ne 0) { throw ('compile failed: ' + $LASTEXITCODE) }
 Write-Output ("built " + $out + " (" + (Get-Item $out).Length + " bytes)")

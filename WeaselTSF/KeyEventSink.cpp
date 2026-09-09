@@ -3,6 +3,7 @@
 #include "WeaselTSF.h"
 #include <KeyEvent.h>
 #include "CandidateList.h"
+#include "GhostEngine.h"
 
 static weasel::KeyEvent prevKeyEvent;
 static BOOL prevfEaten = FALSE;
@@ -92,6 +93,10 @@ STDMETHODIMP WeaselTSF::OnTestKeyDown(ITfContext* pContext,
     *pfEaten = TRUE;
     return S_OK;
   }
+  if (_TryCommitPrediction(pContext, wParam, pfEaten)) {
+    _fTestKeyDownPending = TRUE;
+    return S_OK;
+  }
   _ProcessKeyEvent(wParam, lParam, pfEaten);
   _UpdateComposition(pContext);
   if (*pfEaten)
@@ -108,8 +113,10 @@ STDMETHODIMP WeaselTSF::OnKeyDown(ITfContext* pContext,
     _fTestKeyDownPending = FALSE;
     *pfEaten = TRUE;
   } else {
-    _ProcessKeyEvent(wParam, lParam, pfEaten);
-    _UpdateComposition(pContext);
+    if (!_TryCommitPrediction(pContext, wParam, pfEaten)) {
+      _ProcessKeyEvent(wParam, lParam, pfEaten);
+      _UpdateComposition(pContext);
+    }
   }
   return S_OK;
 }
@@ -199,3 +206,22 @@ BOOL WeaselTSF::_InitPreservedKey() {
 }
 
 void WeaselTSF::_UninitPreservedKey() {}
+
+bool WeaselTSF::_TryCommitPrediction(ITfContext* pContext, WPARAM wParam, BOOL* pfEaten) {
+  LlmLog(L"tab try wparam=" + std::to_wstring(wParam));
+  if (wParam != VK_TAB) return false;
+  std::wstring text;
+  if (!_cand || !_cand->GetPrediction(text) || text.empty()) return false;
+  _cand->ClearPrediction();
+  LlmLog(L"tab commit len=" + std::to_wstring(text.size()));
+  _HideGhostPrediction();
+  // Clear the pending pinyin composition first; otherwise the original
+  // preedit stays on screen and gets committed later, duplicating the text.
+  _AbortComposition();
+  _CommitPrediction(pContext, text);
+  // [FEEDBACK-001] positive sample: the user accepted this prediction.
+  if (m_ghostEngine)
+    m_ghostEngine->ReportFeedbackAsync("accept", static_cast<int>(text.size()));
+  if (pfEaten) *pfEaten = TRUE;
+  return true;
+}

@@ -54,6 +54,8 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
   void DestroyAll();
   void StartUI();
   void EndUI();
+  bool GetPrediction(std::wstring& out) const;
+  void ClearPrediction();
 
   com_ptr<ITfContext> GetContextDocument();
   bool GetIsReposition() {
@@ -76,6 +78,23 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
   // for CCandidateList::Destroy(), when inputing app exit
   void _DisposeUIWindowAll();
   void _MakeUIWindow();
+
+  void _StartPredictionTimer();
+  void _StopPredictionTimer();
+  void _PollPrediction();
+  static LRESULT CALLBACK _TimerWndProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
+
+  weasel::Status _lastStatus;
+  std::wstring _predictionText;
+  std::wstring _lastPolledPrediction;
+  int _pollTicks = 0;
+  weasel::Context _upstreamCtx;
+  bool _inPoll = false;
+  __int64 _lastPredictionMtime = -1;
+  bool _predictionActive = false;
+  size_t _predictionTtlMs = 24 * 60 * 60 * 1000;  // test mode: no external writer yet
+  HWND _timerWnd = nullptr;
+  enum { kPredictionTimerId = 1 };
 
   std::unique_ptr<weasel::UI> _ui;
   DWORD _cRef;

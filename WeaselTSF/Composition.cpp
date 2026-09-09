@@ -437,3 +437,49 @@ BOOL WeaselTSF::_IsComposing() {
 BOOL WeaselTSF::_IsCurrentComposition(ITfComposition* pComposition) {
   return _pComposition != nullptr && _pComposition == pComposition;
 }
+
+/* Commit prediction text without an active composition */
+class CCommitTextEditSession : public CEditSession {
+ public:
+  CCommitTextEditSession(com_ptr<WeaselTSF> pTextService,
+                         com_ptr<ITfContext> pContext,
+                         const std::wstring& text)
+      : CEditSession(pTextService, pContext), _text(text) {}
+  STDMETHODIMP DoEditSession(TfEditCookie ec) {
+    TF_SELECTION selection{};
+    ULONG count = 0;
+    HRESULT hr = _pContext->GetSelection(ec, TF_DEFAULT_SELECTION, 1,
+                                         &selection, &count);
+    LlmLog(L"commit getSelection hr=" + std::to_wstring(hr) +
+           L" count=" + std::to_wstring(count));
+    if (FAILED(hr) || count < 1 || selection.range == nullptr)
+      return S_OK;
+    hr = selection.range->SetText(ec, 0, _text.c_str(),
+                                  static_cast<LONG>(_text.length()));
+    LlmLog(L"commit setText hr=" + std::to_wstring(hr) +
+           L" len=" + std::to_wstring(_text.size()));
+    if (SUCCEEDED(hr)) {
+      selection.range->Collapse(ec, TF_ANCHOR_END);
+      _pContext->SetSelection(ec, 1, &selection);
+    }
+    return S_OK;
+  }
+ private:
+  std::wstring _text;
+};
+
+BOOL WeaselTSF::_CommitPrediction(com_ptr<ITfContext> pContext,
+                                  const std::wstring& text) {
+  if (!pContext || text.empty())
+    return FALSE;
+  CCommitTextEditSession* pEditSession =
+      new CCommitTextEditSession(this, pContext, text);
+  HRESULT hr = E_FAIL;
+  HRESULT request = pContext->RequestEditSession(
+      _tfClientId, pEditSession,
+      TF_ES_ASYNCDONTCARE | TF_ES_READWRITE, &hr);
+  LlmLog(L"commit request hr=" + std::to_wstring(request) +
+         L" async=" + std::to_wstring(hr));
+  pEditSession->Release();
+  return TRUE;
+}

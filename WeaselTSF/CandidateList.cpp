@@ -199,10 +199,47 @@ STDMETHODIMP CCandidateList::FinalizeExactCompositionString() {
 }
 
 void CCandidateList::UpdateUI(const Context& ctx, const Status& status) {
+  if (!_inPoll)
+    _upstreamCtx = ctx;
   if (_ui->style().inline_preedit) {
     _ui->style().client_caps |= weasel::INLINE_PREEDIT_CAPABLE;
   } else {
     _ui->style().client_caps &= ~weasel::INLINE_PREEDIT_CAPABLE;
+  }
+  _lastStatus = status;
+  // [TREE-010 PINYIN] feed the current Rime composition to the engine so the
+  // visible continuation can be constrained by the pinyin being typed.
+  _tsf->_SetGhostPreedit(ctx.preedit.str);
+
+  // Keep the prediction poll alive for the whole TSF instance. StartUI() only
+  // starts it when the host allows the default candidate UI, and Destroy()
+  // (focus loss / abort) used to leave it stopped forever.
+  _StartPredictionTimer();
+
+  std::wstring pred = _tsf->_GetGhostPrediction();
+  bool pred_changed = (pred != _predictionText);
+  if (pred_changed) {
+    LlmLog(L"candidate pred=" + pred + L" composing=" +
+           std::to_wstring(status.composing ? 1 : 0));
+    _predictionText = pred;
+    _predictionActive = !pred.empty();
+  }
+  if (!pred.empty()) {
+    // Always refresh the panel content (normal candidates may have changed),
+    // but only re-show / re-arm the timeout when needed.
+    Context local = ctx;
+    local.cinfo.candies.insert(local.cinfo.candies.begin(), Text(pred));
+    local.cinfo.labels.insert(local.cinfo.labels.begin(), Text(L"Tab"));
+    local.cinfo.comments.insert(local.cinfo.comments.begin(), Text());
+    local.cinfo.highlighted = 0;
+    _ui->Update(local, status);
+    _UpdateUIElement();
+    if (status.composing) {
+      Show(_pbShow);
+    } else if (pred_changed || !_ui->IsShown()) {
+      Show(_pbShow);
+    }
+    return;
   }
 
   /// In UWP, candidate window will only be shown
@@ -226,12 +263,17 @@ void CCandidateList::UpdateInputPosition(RECT const& rc) {
 }
 
 void CCandidateList::Destroy() {
+  _StopPredictionTimer();
+  // The UI element is gone; allow a later StartUI() to restart the prediction
+  // timer instead of early-returning on a stale flag.
+  _uiStarted = false;
   // EndUI();
   Show(FALSE);
   _DisposeUIWindow();
 }
 
 void CCandidateList::DestroyAll() {
+  _StopPredictionTimer();
   // EndUI();
   Show(FALSE);
   _DisposeUIWindowAll();
@@ -312,6 +354,7 @@ void CCandidateList::StartUI() {
   if (_pbShow) {
     _ui->style() = _style;
     _MakeUIWindow();
+    _StartPredictionTimer();
   }
 }
 
@@ -447,4 +490,78 @@ void WeaselTSF::HandleUICallback(size_t* const sel,
     _HandleMouseHoverEvent(*hov);
   else if (next || scroll_next)
     _HandleMousePageEvent(next, scroll_next);
+}
+
+bool CCandidateList::GetPrediction(std::wstring& out) const {
+  if (!_predictionActive || _predictionText.empty()) { out.clear(); return false; }
+  out = _predictionText;
+  return true;
+}
+
+void CCandidateList::ClearPrediction() {
+  _predictionActive = false;
+  _predictionText.clear();
+  _lastPredictionMtime = -1;
+  Show(FALSE);
+}
+
+void CCandidateList::_StartPredictionTimer() {
+  if (_timerWnd) return;
+  HINSTANCE h = GetModuleHandle(NULL);
+  static const wchar_t* className = L"WeaselPredictionTimerWnd";
+  WNDCLASSW wc = {};
+  if (GetClassInfoW(h, className, &wc) == 0) {
+    wc.lpfnWndProc = _TimerWndProc;
+    wc.hInstance = h;
+    wc.lpszClassName = className;
+    RegisterClassW(&wc);
+  }
+  _timerWnd = CreateWindowExW(0, className, L"", 0, 0, 0, 0, 0,
+                              HWND_MESSAGE, NULL, h, NULL);
+  if (_timerWnd) {
+    SetWindowLongPtrW(_timerWnd, GWLP_USERDATA, (LONG_PTR)this);
+    SetTimer(_timerWnd, kPredictionTimerId, 500, NULL);
+  }
+}
+
+void CCandidateList::_StopPredictionTimer() {
+  if (_timerWnd) {
+    KillTimer(_timerWnd, kPredictionTimerId);
+    DestroyWindow(_timerWnd);
+    _timerWnd = nullptr;
+  }
+}
+
+LRESULT CALLBACK CCandidateList::_TimerWndProc(HWND hWnd, UINT uMsg,
+                                               WPARAM wParam, LPARAM lParam) {
+  if (uMsg == WM_TIMER && wParam == kPredictionTimerId) {
+    CCandidateList* self =
+        reinterpret_cast<CCandidateList*>(GetWindowLongPtrW(hWnd, GWLP_USERDATA));
+    if (self) self->_PollPrediction();
+    return 0;
+  }
+  return DefWindowProcW(hWnd, uMsg, wParam, lParam);
+}
+
+void CCandidateList::_PollPrediction() {
+  if (!_tsf || !_ui)
+    return;
+  std::wstring pred = _tsf->_GetGhostPrediction();
+  if (pred == _lastPolledPrediction) {
+    // Heartbeat (10s) so the log can prove the poll loop is still alive.
+    if (++_pollTicks >= 20) {
+      _pollTicks = 0;
+      LlmLog(L"candidate poll alive; pred_len=" +
+             std::to_wstring(pred.size()));
+    }
+    return;
+  }
+  _pollTicks = 0;
+  _lastPolledPrediction = pred;
+  // Refresh from the pristine upstream context. Using _ui->ctx() here would
+  // feed the already-injected prediction back into the injection path and
+  // grow the candidate list on every poll.
+  _inPoll = true;
+  UpdateUI(_upstreamCtx, _lastStatus);
+  _inPoll = false;
 }
