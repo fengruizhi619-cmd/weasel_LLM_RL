@@ -92,3 +92,16 @@ python offline_train.py --epochs 3
 训练方法与在线完全一致：从 ctx 建候选树 → `reward = 叶子cum × 字符匹配比例`
 → 对 lm_head 做一步 SGD；回退用 unlikelihood。checkpoint 共用同一套五槽，
 在线/离线是同一条权重血脉。
+
+## 后台数据采集（与输入法无关）
+
+记录器现在**不依赖小狼毫**：无论你用微软拼音、搜狗还是小狼毫，只要钩子
+（`WeaselExpContextV0.exe`，UIA 订阅文本变化）在跑，`offline_recorder.py`
+就会在后台持续把「上下文 + 提交段」写进 `diag/segments.jsonl`。
+
+- 常驻方式：看门狗计划任务（登录时 + 每 5 分钟）确保钩子和记录器都在；
+  记录器有单实例锁（`diag/recorder.lock`），多个启动方不会重复。
+- 记录器独立于 WeaselServer：切换模式或重启小狼毫都不会打断采集。
+- 在线模式下记录器同样在跑，所以在线/离线的数据都在积累。
+
+`ghost_mode.py status` 会同时显示模式、引擎、记录器和已记录的段数。

@@ -98,6 +98,17 @@ def weasel_pids():
               "ForEach-Object { $_.Id }")
 
 
+def start_recorder():
+    """The segment recorder is background collection: it must survive mode
+    switches and run for every input method."""
+    cmd = [r"E:\python\pythonw.exe", os.path.join(HERE, "offline_recorder.py"),
+           "--log-file", os.path.join(HERE, "diag", "exp-run-v02.log"),
+           "--out", os.path.join(HERE, "diag", "segments.jsonl")]
+    subprocess.Popen(cmd, cwd=HERE, close_fds=True,
+                     creationflags=NO_WINDOW,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 def restart_weasel():
     for pid in weasel_pids():
         kill(int(pid))
@@ -136,13 +147,16 @@ def main():
         return 0
 
     write_mode(args.mode)
-    for pid in engine_pids() + recorder_pids():
+    for pid in engine_pids():
         kill(pid)
+    if not recorder_pids():
+        start_recorder()
     time.sleep(0.5)
     restarted = restart_weasel()
     time.sleep(2.0)
     print("mode=%s  weasel_restarted=%s" % (args.mode, restarted))
-    print("(WeaselServer now hosts %s)" %
+    print("(WeaselServer hosts %s; the segment recorder runs in the "
+          "background for every input method)" %
           ("offline_recorder.py" if args.mode == "offline" else "online_server.py"))
     print("waiting for it to come up...")
     for _ in range(45):
@@ -150,9 +164,8 @@ def main():
         if args.mode == "offline":
             if recorder_pids():
                 break
-        else:
-            if health() == "200":
-                break
+        elif health() == "200" and recorder_pids():
+            break
     status()
     return 0
 

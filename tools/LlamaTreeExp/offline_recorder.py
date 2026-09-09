@@ -17,6 +17,7 @@ import argparse
 import io
 import os
 import re
+import subprocess
 import sys
 import time
 
@@ -94,6 +95,9 @@ class Recorder:
                 size = os.path.getsize(log_file)
             except OSError:
                 continue
+            if size < pos:
+                # the hook restarted / the log was rotated
+                pos = 0
             if size <= pos:
                 continue
             with io.open(log_file, "r", encoding="utf-8", errors="replace") as f:
@@ -112,6 +116,30 @@ class Recorder:
                         print("[recorder] %r" % (exc,), flush=True)
 
 
+LOCK_FILE = os.path.join(HERE, "diag", "recorder.lock")
+
+
+def already_running():
+    """Single instance: the recorder must survive any input method, so several
+    starters (watchdog, WeaselServer, ghost_mode.py) may race."""
+    try:
+        with io.open(LOCK_FILE, encoding="utf-8") as f:
+            pid = int(f.read().strip())
+    except Exception:
+        return False
+    out = subprocess.run(
+        ["powershell", "-NoProfile", "-Command",
+         "Get-Process -Id %d -ErrorAction SilentlyContinue | ForEach-Object { $_.Id }" % pid],
+        capture_output=True, text=True)
+    return str(pid) in out.stdout
+
+
+def write_lock():
+    os.makedirs(os.path.dirname(LOCK_FILE), exist_ok=True)
+    with io.open(LOCK_FILE, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--log-file", default=os.path.join(HERE, "diag", "exp-run-v02.log"))
@@ -119,8 +147,20 @@ def main():
     ap.add_argument("--stats", default=os.path.join(HERE, "diag", "segments_stats.jsonl"))
     ap.add_argument("--ctx-chars", type=int, default=256)
     args = ap.parse_args()
-    print("[recorder] offline mode: logging context + segments only", flush=True)
-    Recorder(args).run()
+    if already_running():
+        print("[recorder] another recorder is already running, exiting", flush=True)
+        return 0
+    write_lock()
+    print("[recorder] background collection: context + segments (any IME)",
+          flush=True)
+    try:
+        Recorder(args).run()
+    finally:
+        try:
+            os.remove(LOCK_FILE)
+        except OSError:
+            pass
+    return 0
 
 
 if __name__ == "__main__":
