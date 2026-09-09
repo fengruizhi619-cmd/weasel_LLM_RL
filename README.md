@@ -181,7 +181,13 @@ WeaselServer 启动时读取 `%APPDATA%\Rime\ghost_mode.txt`，按模式拉起�
 
 本项目是 [rime/weasel](https://github.com/rime/weasel) 的衍生作品，遵循 **GPLv3**（见 `LICENSE.txt`）。
 
-上游项目与依赖：
+### 代码主要贡献
+
+- DeepSeek V4.1 Flash 0910
+- DeepSeek V4 Flash 0731
+- GLM-5.3-Flash
+
+### 上游项目与依赖
 
 - 中州韻輸入法引擎 / Rime Input Method Engine
 - [librime](https://github.com/rime/librime)、[plum](https://github.com/rime/plum)
