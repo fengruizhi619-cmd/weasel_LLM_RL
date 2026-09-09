@@ -76,8 +76,12 @@ def main():
         print("[offline] resumed updates=%d" % ckpt.updates, flush=True)
 
     steps = hits = 0
+    total = len(todo)
     for epoch in range(max(1, args.epochs)):
-        for rec in todo:
+        for index, rec in enumerate(todo):
+            if (index + 1) % 5 == 0 or index + 1 == total:
+                print("[progress] %d/%d hits=%d steps=%d"
+                      % (index + 1, total, hits, steps), flush=True)
             ctx = rec.get("ctx", "")
             segment = rec.get("segment", "")
             kind = rec.get("kind", "commit")

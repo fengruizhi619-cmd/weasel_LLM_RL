@@ -2,14 +2,18 @@
 # -*- coding: utf-8 -*-
 """LLM 数据面板：累计条数 + 离线训练入口（样本一次用完即丢）。
 
-- 显示当前待训练条数、已训练条数、模式与进程状态
-- 「训练并丢弃」把 segments.jsonl 交给 offline_train.py，训练成功后直接删掉
-  这份数据（不重复使用样本），记录器会自动开始下一批
+一条数据 = 一次提交断点。例如「你吃饭了吗」被输入法分四次上屏，
+就记成 你 / 吃饭 / 了 / 吗 四条；回退记一条 backspace。
+
+训练在独立进程里跑（CREATE_NO_WINDOW，无控制台窗口），输出由后台
+线程读进队列，UI 线程用 after() 轮询，所以训练期间面板不会卡。
+进度条按 offline_train.py 的 [progress] i/total 行更新。
 """
 import io
 import os
+import queue
 import subprocess
-import sys
+import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
@@ -28,7 +32,7 @@ def count_lines(path):
     if not os.path.exists(path):
         return 0
     with io.open(path, "rb") as f:
-        return sum(1 for _ in f)
+        return sum(1 for line in f if line.strip())
 
 
 def read_mode():
@@ -40,68 +44,95 @@ def read_mode():
 
 
 def process_alive(pattern):
-    out = subprocess.run(
-        ["powershell", "-NoProfile", "-Command",
-         "Get-CimInstance Win32_Process -Filter \"Name like '%python%'\" | "
-         "Where-Object { $_.CommandLine -like '*" + pattern + "*' } | "
-         "ForEach-Object { $_.ProcessId }"],
-        capture_output=True, text=True)
+    script = ("Get-CimInstance Win32_Process | Where-Object { $_.Name -like "
+              "\"*python*\" -and $_.CommandLine -like \"*" + pattern +
+              "*\" } | ForEach-Object { $_.ProcessId }")
+    out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
+                         capture_output=True, text=True,
+                         creationflags=NO_WINDOW)
     return bool(out.stdout.strip())
 
 
-def trained_count():
-    n = 0
-    if os.path.exists(STATS):
-        with io.open(STATS, encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if line.strip():
-                    n += 1
-    return n
+def trained_batches():
+    if not os.path.exists(STATS):
+        return 0
+    with io.open(STATS, encoding="utf-8", errors="replace") as f:
+        return sum(1 for line in f if line.strip())
+
+
+def trim_consumed(path, consumed):
+    """Drop the first `consumed` records, keep anything written meanwhile."""
+    if not os.path.exists(path):
+        return 0
+    with io.open(path, "r", encoding="utf-8", errors="replace") as f:
+        lines = f.readlines()
+    keep = [ln for ln in lines[consumed:] if ln.strip()]
+    if keep:
+        with io.open(path, "w", encoding="utf-8", newline="") as f:
+            f.writelines(keep)
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    try:
+        os.remove(SEEN)
+    except OSError:
+        pass
+    return len(keep)
 
 
 class Panel(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("LLM 数据面板 · cli_emojiless_RL")
-        self.geometry("420x320")
+        self.geometry("480x470")
         self.resizable(False, False)
         self.proc = None
-        self.after_id = None
+        self.queue = queue.Queue()
+        self.trained_lines = 0
 
-        style = ttk.Style(self)
         try:
-            style.theme_use("vista")
+            ttk.Style(self).theme_use("vista")
         except Exception:
             pass
 
         self.mode_var = tk.StringVar()
         self.pending_var = tk.StringVar()
         self.trained_var = tk.StringVar()
-        self.status_var = tk.StringVar()
+        self.status_var = tk.StringVar(value="检测中…")
+        self.progress_var = tk.StringVar(value="空闲")
 
-        pad = {"padx": 12, "pady": 6, "sticky": "w"}
-        ttk.Label(self, text="模式", width=10).grid(row=0, column=0, **pad)
+        pad = {"padx": 12, "pady": 5, "sticky": "w"}
+        ttk.Label(self, text="模式", width=8).grid(row=0, column=0, **pad)
         ttk.Label(self, textvariable=self.mode_var).grid(row=0, column=1, **pad)
-        ttk.Label(self, text="待训练", width=10).grid(row=1, column=0, **pad)
+        ttk.Label(self, text="待训练", width=8).grid(row=1, column=0, **pad)
         ttk.Label(self, textvariable=self.pending_var).grid(row=1, column=1, **pad)
-        ttk.Label(self, text="已训练", width=10).grid(row=2, column=0, **pad)
+        ttk.Label(self, text="已训练", width=8).grid(row=2, column=0, **pad)
         ttk.Label(self, textvariable=self.trained_var).grid(row=2, column=1, **pad)
-        ttk.Label(self, text="进程", width=10).grid(row=3, column=0, **pad)
+        ttk.Label(self, text="进程", width=8).grid(row=3, column=0, **pad)
         ttk.Label(self, textvariable=self.status_var).grid(row=3, column=1, **pad)
 
         buttons = ttk.Frame(self)
-        buttons.grid(row=4, column=0, columnspan=2, pady=10)
+        buttons.grid(row=4, column=0, columnspan=2, pady=8)
         self.train_btn = ttk.Button(buttons, text="训练并丢弃", command=self.train)
         self.train_btn.pack(side="left", padx=6)
         ttk.Button(buttons, text="刷新", command=self.refresh).pack(side="left", padx=6)
         ttk.Button(buttons, text="打开数据目录", command=self.open_dir).pack(side="left", padx=6)
 
-        self.log_text = tk.Text(self, height=8, width=52, state="disabled",
+        ttk.Label(self, textvariable=self.progress_var).grid(
+            row=5, column=0, columnspan=2, padx=12, sticky="w")
+        self.progress = ttk.Progressbar(self, mode="determinate", length=450)
+        self.progress.grid(row=6, column=0, columnspan=2, padx=12, pady=(0, 6))
+
+        self.log_text = tk.Text(self, height=11, width=60, state="disabled",
                                 background="#f7f7f7", relief="flat")
-        self.log_text.grid(row=5, column=0, columnspan=2, padx=12, pady=(0, 10))
+        self.log_text.grid(row=7, column=0, columnspan=2, padx=12, pady=(0, 10))
 
         self.refresh()
-        self.log("样本一次用完即丢：训练成功后这份数据会被删除。")
+        self.log("一条数据 = 一次提交断点：你 / 吃饭 / 了 / 吗 = 4 条；回退 = 1 条。")
+        self.log("训练在独立无窗口进程里跑，面板不卡；成功后这批样本丢弃。")
+        self.after(200, self.drain)
 
     def log(self, message):
         self.log_text.config(state="normal")
@@ -115,55 +146,105 @@ class Panel(tk.Tk):
     def refresh(self):
         self.mode_var.set(read_mode())
         self.pending_var.set("%d 条" % count_lines(SEGMENTS))
-        self.trained_var.set("%d 批" % trained_count())
-        engine = "运行中" if process_alive("online_server.py") else "未运行"
-        recorder = "运行中" if process_alive("offline_recorder.py") else "未运行"
-        self.status_var.set("引擎 %s / 记录器 %s" % (engine, recorder))
+        self.trained_var.set("%d 批" % trained_batches())
+        self.detect_processes()
+
+    def detect_processes(self):
+        self.status_var.set("检测中…")
+
+        def worker():
+            engine = "运行中" if process_alive("online_server.py") else "未运行"
+            recorder = "运行中" if process_alive("offline_recorder.py") else "未运行"
+            self.queue.put(("status", "引擎 %s / 记录器 %s" % (engine, recorder)))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def drain(self):
+        try:
+            while True:
+                item = self.queue.get_nowait()
+                if item is None:
+                    self.finish()
+                    continue
+                kind, payload = item
+                if kind == "status":
+                    self.status_var.set(payload)
+                elif kind == "line":
+                    self.handle_line(payload)
+        except queue.Empty:
+            pass
+        self.after(200, self.drain)
 
     def train(self):
         if self.proc is not None:
             return
-        if count_lines(SEGMENTS) == 0:
+        pending = count_lines(SEGMENTS)
+        if pending == 0:
             messagebox.showinfo("LLM 数据面板", "当前没有待训练数据。")
             return
         if not messagebox.askyesno(
                 "LLM 数据面板",
-                "用当前这批数据训练一次，训练成功后数据会被删除（样本不重复使用）。继续？"):
+                "用这 %d 条数据训练一次？训练成功后这批样本会被丢弃。\n"
+                "训练在后台无窗口进程里跑，面板可以继续使用。" % pending):
             return
+        self.trained_lines = pending
         self.train_btn.config(state="disabled", text="训练中…")
-        self.log("开始离线训练…")
+        self.progress["maximum"] = max(1, pending)
+        self.progress["value"] = 0
+        self.progress_var.set("准备中…（加载模型约 30 秒）")
+        self.log("开始离线训练：%d 条（无窗口）" % pending)
         self.proc = subprocess.Popen(
             [PYTHON, TRAIN], cwd=HERE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT, text=True, encoding="utf-8",
             errors="replace", creationflags=NO_WINDOW)
-        self.after_id = self.after(500, self.poll)
+        threading.Thread(target=self._reader, args=(self.proc,),
+                         daemon=True).start()
 
-    def poll(self):
-        if self.proc is None:
-            return
-        line = self.proc.stdout.readline()
-        while line:
-            self.log(line.rstrip())
-            line = self.proc.stdout.readline()
-        if self.proc.poll() is None:
-            self.after_id = self.after(500, self.poll)
-            return
-        code = self.proc.returncode
+    def _reader(self, proc):
+        try:
+            for line in proc.stdout:
+                self.queue.put(("line", line.rstrip()))
+        finally:
+            self.queue.put(None)
+
+    def handle_line(self, line):
+        if line.startswith("[progress] "):
+            parts = line.split()
+            try:
+                current, total = parts[1].split("/")
+                self.progress["maximum"] = max(1, int(total))
+                self.progress["value"] = int(current)
+                extra = " ".join(parts[2:])
+                self.progress_var.set("训练中 %s / %s 条  %s"
+                                      % (current, total, extra))
+            except Exception:
+                pass
+        elif line.startswith("[offline] done") or line.startswith("[offline] "):
+            self.progress_var.set(line)
+        self.log(line)
+
+    def finish(self):
+        proc = self.proc
+        code = -1
+        if proc is not None:
+            try:
+                code = proc.wait(timeout=15)
+            except Exception:
+                code = proc.returncode if proc.returncode is not None else -1
         self.proc = None
         self.train_btn.config(state="normal", text="训练并丢弃")
         if code == 0:
-            removed = count_lines(SEGMENTS)
-            try:
-                if os.path.exists(SEGMENTS):
-                    os.remove(SEGMENTS)
-                if os.path.exists(SEEN):
-                    os.remove(SEEN)
-            except OSError as exc:
-                self.log("删除数据失败: %r" % (exc,))
+            kept = trim_consumed(SEGMENTS, self.trained_lines)
             with io.open(STATS, "a", encoding="utf-8") as f:
-                f.write("%s trained=%d\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), removed))
-            self.log("训练完成，已丢弃 %d 条样本。" % removed)
+                f.write("%s trained=%d kept=%d\n"
+                        % (time.strftime("%Y-%m-%d %H:%M:%S"),
+                           self.trained_lines, kept))
+            self.progress_var.set("完成：训练 %d 条并丢弃，期间新增保留 %d 条"
+                                  % (self.trained_lines, kept))
+            self.log("训练完成：消费 %d 条并丢弃；期间新增 %d 条保留。"
+                     % (self.trained_lines, kept))
         else:
+            self.progress_var.set("训练失败（exit=%d），数据保留" % code)
             self.log("训练失败（exit=%d），数据保留。" % code)
         self.refresh()
 
