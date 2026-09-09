@@ -141,10 +141,20 @@ build.bat
 
 ### 部署
 
-1. 把 `weaselx64.dll`、`WeaselServer.exe` 复制到 Rime 安装目录
-2. 把 `tools/LlamaTreeExp/ghost_service.cmd`、`ghost_data_panel.cmd` 一并复制过去
-3. 在安装目录建 `ghost_home.txt`，内容是本仓库根路径（一行）
-4. 让注册表 `HKLM\SOFTWARE\Classes\CLSID\{A3F4CDED-B1E9-41EE-9CA6-7B4D0DE6CB0A}\InprocServer32` 指向新的 dll
+```powershell
+.\install.ps1
+```
+
+脚本会自动找到 Rime 安装目录、备份原文件、复制 `weaselx64.dll` / `WeaselServer.exe` 与两个 `ghost_*.cmd`，
+写入 `ghost_home.txt`、把 TSF CLSID 指向新 dll，然后重启 WeaselServer。
+
+```powershell
+.\install.ps1 -DryRun                                          # 只预览，不改动系统
+.\install.ps1 -RimeHome "C:\Program Files\Rime\weasel-0.17.4"  # 手动指定安装目录
+.\install.ps1 -Uninstall                                       # 恢复备份并清理
+```
+
+安装前建议先跑一次 `-DryRun`，确认它找对了目录。
 
 ### 运行
 
