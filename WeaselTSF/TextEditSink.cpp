@@ -20,14 +20,29 @@ static BOOL IsRangeCovered(TfEditCookie ec,
 STDMETHODIMP WeaselTSF::OnEndEdit(ITfContext* pContext,
                                   TfEditCookie ecReadOnly,
                                   ITfEditRecord* pEditRecord) {
+  // [GHOST-020] Ask the edit record up front what actually changed, so the
+  // prediction can be dropped when the document moved underneath it.
+  BOOL fSelectionChanged = FALSE;
+  IEnumTfRanges* pEnumTextChanges = NULL;
+  ITfRange* pRange = NULL;
+  BOOL hasTextChange = FALSE;
+  if (pEditRecord->GetSelectionStatus(&fSelectionChanged) != S_OK)
+    fSelectionChanged = FALSE;
+  if (pEditRecord->GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, NULL, 0,
+                                             &pEnumTextChanges) == S_OK) {
+    if (pEnumTextChanges->Next(1, &pRange, NULL) == S_OK) {
+      hasTextChange = TRUE;
+      pRange->Release();
+    }
+    pEnumTextChanges->Release();
+  }
+
   _UpdateGhostSnapshot(pContext, ecReadOnly);
-  BOOL fSelectionChanged;
-  IEnumTfRanges* pEnumTextChanges;
-  ITfRange* pRange;
+  if (fSelectionChanged || hasTextChange)
+    _SyncGhostDocument(pContext, ecReadOnly);
 
   /* did the selection change? */
-  if (pEditRecord->GetSelectionStatus(&fSelectionChanged) == S_OK &&
-      fSelectionChanged) {
+  if (fSelectionChanged) {
     if (_IsComposing()) {
       /* if the caret moves out of composition range, stop the composition */
       TF_SELECTION tfSelection;
@@ -46,14 +61,6 @@ STDMETHODIMP WeaselTSF::OnEndEdit(ITfContext* pContext,
     }
   }
 
-  /* text modification? */
-  if (pEditRecord->GetTextAndPropertyUpdates(TF_GTP_INCL_TEXT, NULL, 0,
-                                             &pEnumTextChanges) == S_OK) {
-    if (pEnumTextChanges->Next(1, &pRange, NULL) == S_OK) {
-      pRange->Release();
-    }
-    pEnumTextChanges->Release();
-  }
   return S_OK;
 }
 

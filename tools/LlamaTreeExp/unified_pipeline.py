@@ -340,6 +340,78 @@ class TreeEngine:
         self.model.eval()
         return loss.item()
 
+    def train_sequence(self, prompt_text, target_text, k=20, grad_clip=1.0,
+                       miss_weight=0.3, dry_run=False):
+        """[TRAIN-020 TOPK] Rank-scored RL over one run of real text.
+
+        Training does not need the display tree. One frozen-backbone prefill,
+        then one single-token decode per character: for every step the trainable
+        head is asked for its top-k next characters, and the character the user
+        actually typed is matched against that list. The reward grows with the
+        probability and with the rank (the earlier it appears, the more it is
+        worth). A miss still produces a step - the wrong top-1 is pushed down -
+        so no recorded text is thrown away.
+
+        The backbone is frozen, so its KV cache stays valid across the head
+        updates and the walk costs one token per step.
+
+        Returns (steps, hits, reward_sum).
+        """
+        prompt_ids = self.tokenizer.encode(prompt_text, add_special_tokens=False)
+        target_ids = self.tokenizer.encode(target_text, add_special_tokens=False)
+        if not prompt_ids or not target_ids:
+            return 0, 0, 0.0
+
+        steps = hits = 0
+        reward_sum = 0.0
+        head_dtype = self.model.lm_head.weight.dtype
+
+        with torch.no_grad():
+            out = self.model.model(
+                input_ids=torch.tensor([prompt_ids], device=self.device),
+                use_cache=True)
+            hidden = out.last_hidden_state[0, -1, :]
+            past = out.past_key_values
+
+        self.model.train()
+        for target_id in target_ids:
+            logits = self.model.lm_head(hidden.to(head_dtype).unsqueeze(0))[0]
+            log_probs = F.log_softmax(logits, dim=-1)
+            with torch.no_grad():
+                probs = log_probs.detach().exp()
+                top_p, top_id = torch.topk(probs, min(k, probs.shape[-1]))
+                match = (top_id == target_id).nonzero(as_tuple=True)[0]
+                rank = int(match[0].item()) if match.numel() else -1
+                if rank >= 0:
+                    reward = float(top_p[rank]) * (1.0 - rank / float(top_id.shape[0]))
+                else:
+                    reward = 0.0
+
+            if rank >= 0:
+                hits += 1
+                reward_sum += reward
+                loss = -reward * log_probs[target_id]
+            else:
+                loss = miss_weight * log_probs[int(top_id[0].item())]
+
+            steps += 1
+            if not dry_run:
+                self.optimizer.zero_grad()
+                loss.backward()
+                if grad_clip and grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        [self.model.lm_head.weight], grad_clip)
+                self.optimizer.step()
+
+            with torch.no_grad():
+                out = self.model.model(
+                    input_ids=torch.tensor([[int(target_id)]], device=self.device),
+                    past_key_values=past, use_cache=True)
+                hidden = out.last_hidden_state[0, -1, :]
+                past = out.past_key_values
+        self.model.eval()
+        return steps, hits, reward_sum
+
     def save_checkpoint(self, path, updates=0, dtype="float32", lock=None):
         """P1-5: keep the master head in fp32; P1-8: copy under the engine lock."""
         target = torch.float16 if dtype == "float16" else torch.float32

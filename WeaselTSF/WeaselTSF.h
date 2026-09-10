@@ -190,6 +190,9 @@ class WeaselTSF : public ITfTextInputProcessorEx,
  public:
   std::wstring _GetGhostPrediction();
   void _SetGhostPreedit(const std::wstring& preedit);
+  bool _ReadGhostPrefix(ITfContext* pContext, TfEditCookie ecReadOnly,
+                        std::wstring* prefix, LONG* caret, RECT* caret_rect);
+  void _SyncGhostDocument(ITfContext* pContext, TfEditCookie ecReadOnly);
   bool _HasGhostPrediction();
   void _HideGhostPrediction();
  private:

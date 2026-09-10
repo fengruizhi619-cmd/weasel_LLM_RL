@@ -169,8 +169,14 @@ class CandidateTree {
             consumed = take;
           }
         }
-        if (best < 0)
-          remaining.clear();
+        if (best < 0) {
+          // [TREE-016 PINYIN-STRICT] The pinyin still to be consumed has no
+          // matching branch here. Stop the walk instead of clearing |remaining|
+          // and falling through to the unconstrained pick below: appending a
+          // mismatching character is exactly what made the preview look like
+          // random words while a composition was live.
+          break;
+        }
       }
       if (best < 0) {
         for (int child : item.children) {

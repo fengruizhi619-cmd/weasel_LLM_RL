@@ -6,6 +6,7 @@ WeaselExpContextV0 log -> reward check on previous tree
 -> multi-slot checkpoint persistence.
 """
 import argparse
+import torch
 import os
 import re
 import signal
@@ -43,14 +44,43 @@ def find_best_reward(root, typed_text):
                 continue
             if typed_text.startswith(path):
                 ratio = 1.0
-                if len(typed_text) < len(path):
-                    ratio = len(typed_text) / len(path)
-                score = child.cum * ratio
-                if score > best:
-                    best = score
-                    best_path = path
+            elif path.startswith(typed_text):
+                # [TRAIN-019] The tree guessed further ahead than the user
+                # actually typed. That is a partial hit and used to score 0 -
+                # the old code only reached its partial-credit branch when the
+                # typed text was LONGER than the path, which cannot happen
+                # inside a startswith() test, so the branch was dead.
+                ratio = float(len(typed_text)) / float(len(path))
+            else:
+                continue
+            score = child.cum * ratio
+            if score > best:
+                best = score
+                best_path = path
             stack.append(child)
     return best, best_path
+
+
+def top_path(root, max_len=24):
+    """Highest cumulative-probability chain in the tree (the model's own guess).
+
+    Used as the negative target when the user typed something the tree did not
+    contain: that guess is what the head should be pushed away from.
+    """
+    text = ""
+    node = root
+    while node is not None and len(text) < max_len:
+        best = None
+        for child in node.children:
+            if not child.tok:
+                continue
+            if best is None or child.cum > best.cum:
+                best = child
+        if best is None:
+            break
+        text += best.tok
+        node = best
+    return text
 
 
 class CheckpointManager:
@@ -61,6 +91,9 @@ class CheckpointManager:
         self.dirty = False
         self.updates = 0
         self.last_save = {}
+        # [P1-9] bookkeeping for sync_from_disk()
+        self._last_write_ts = 0.0
+        self._last_sync_check = 0.0
         os.makedirs(ckpt_dir, exist_ok=True)
 
     def load_latest(self):
@@ -90,9 +123,54 @@ class CheckpointManager:
         self.dirty = True
         self.updates += 1
 
+    def sync_from_disk(self, min_interval_s=15.0):
+        """[P1-9] Adopt a newer head written by another process.
+
+        The offline trainer and the online service share these five slots. The
+        service keeps its own copy of the head in memory and used to write it
+        back on its diluted schedule, which silently rolled back anything the
+        trainer had just produced. Before every save we therefore look for a
+        slot that is newer than our own last write and carries more updates; if
+        one exists we load it instead of overwriting it.
+
+        Returns True when our weights were replaced.
+        """
+        now = time.time()
+        if now - self._last_sync_check < min_interval_s:
+            return False
+        self._last_sync_check = now
+
+        newest = None
+        for name, _interval in SLOTS:
+            path = os.path.join(self.ckpt_dir, name)
+            try:
+                mtime = os.stat(path).st_mtime
+            except OSError:
+                continue
+            if mtime <= self._last_write_ts + 1e-6:
+                continue
+            if newest is None or mtime > newest[1]:
+                newest = (path, mtime)
+        if newest is None:
+            return False
+        try:
+            meta = torch.load(newest[0], map_location="cpu", mmap=True,
+                              weights_only=False)
+            disk_updates = int(meta.get("updates") or 0)
+        except Exception:
+            return False
+        if disk_updates <= self.updates:
+            return False
+        if not self.engine.load_checkpoint(newest[0]):
+            return False
+        self.updates = disk_updates
+        self._last_write_ts = newest[1]
+        return True
+
     def save_epoch(self, force=False, lock=None):
+        adopted = self.sync_from_disk()
         if not self.dirty:
-            return
+            return adopted
         now = time.time()
         for name, interval in SLOTS:
             last = self.last_save.get(name, 0.0)
@@ -101,7 +179,9 @@ class CheckpointManager:
                     os.path.join(self.ckpt_dir, name), updates=self.updates,
                     dtype=self.ckpt_dtype, lock=lock)
                 self.last_save[name] = now
+                self._last_write_ts = now
         self.dirty = False
+        return adopted
 
 
 def main():

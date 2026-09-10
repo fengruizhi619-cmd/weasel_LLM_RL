@@ -61,10 +61,22 @@ def norm_pinyin(text):
 
 
 def token_pinyin(tok):
-    """Pinyin for a candidate token; latin/digits pass through as-is."""
+    """Pinyin used by the prefix constraint for one candidate.
+
+    A tree node holds exactly one character, so the constraint has to work on
+    the head character's syllable. Using the whole token's pinyin ("dagai" for
+    the token <da gai>) consumed the entire typed prefix in a single step and
+    left the rest of the path unconstrained - which is why only the first
+    character ever looked constrained. Latin/digits still pass through as-is.
+    """
+    if not tok:
+        return ""
+    head = tok[0]
+    if lazy_pinyin is not None and "\u4e00" <= head <= "\u9fff":
+        return norm_pinyin("".join(lazy_pinyin(head)))
     if lazy_pinyin is None:
         return norm_pinyin(tok)
-    return norm_pinyin("".join(lazy_pinyin(tok)))
+    return norm_pinyin(tok)
 
 
 def common_prefix_len(left, right):
@@ -355,7 +367,10 @@ class EngineService:
             # S6: dynamic branching budget. When the service is getting slow,
             # return fewer candidates so the front end expands a narrower tree.
             limit = n_probs
-            if self.args.dynamic and len(self.metrics.latency_ms) >= 20:
+            # [S3] A live composition needs the wide probe: the pinyin filter
+            # must be able to find a matching syllable inside the sampled set,
+            # and the dynamic shrink starves it (measured 200 -> 55 under load).
+            if self.args.dynamic and not pinyin and len(self.metrics.latency_ms) >= 20:
                 factor = 1.0
                 p50 = self._p50_latency()
                 if p50 > self.args.latency_budget_ms:
@@ -394,8 +409,13 @@ class EngineService:
                 filtered = []
                 for item in entries:
                     tp = token_pinyin(item["token"])
-                    if tp.startswith(pinyin) or (
-                            not tp and item["token"].lower().startswith(pinyin)):
+                    # [S3] Two-way prefix match: the token may extend what is
+                    # typed (tp.startswith) or be a prefix of it (head syllable
+                    # "da" while the user is still at "daga"), otherwise a
+                    # partially typed syllable drops every candidate.
+                    if (tp.startswith(pinyin)
+                            or (tp and pinyin.startswith(tp))
+                            or (not tp and item["token"].lower().startswith(pinyin))):
                         filtered.append(item)
                 if filtered:
                     if len(filtered) != len(entries):
@@ -570,7 +590,10 @@ class EngineService:
         return shown
 
     def save_epoch(self):
-        self.ckpt.save_epoch(lock=self.lock)
+        if self.ckpt.save_epoch(lock=self.lock):
+            # [P1-9] another process (offline training) had a newer head and we
+            # just adopted it, so every cached logit / KV entry is stale now
+            self.reset_cache()
 
     def prefetch_top1(self, ids, top_ids):
         """[P3-4] Warm the LRU with the top-1 continuation.

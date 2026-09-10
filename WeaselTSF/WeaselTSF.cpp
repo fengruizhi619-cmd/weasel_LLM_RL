@@ -290,6 +290,85 @@ bool WeaselTSF::_EnsureServerConnected() {
 }
 
 // [GHOST-TSF-011 SNAPSHOT-COLLECTOR] in-process engine variant
+bool WeaselTSF::_ReadGhostPrefix(ITfContext* pContext,
+                                TfEditCookie ecReadOnly,
+                                std::wstring* prefix, LONG* caret,
+                                RECT* caret_rect) {
+  TF_SELECTION selection{};
+  ULONG selection_count = 0;
+  if (FAILED(pContext->GetSelection(ecReadOnly, TF_DEFAULT_SELECTION, 1,
+                                    &selection, &selection_count)) ||
+      selection_count < 1 || selection.range == nullptr) {
+    weasel::ghost::TraceLine(L"snapshot hidden: no selection");
+    return false;
+  }
+
+  BOOL empty = TRUE;
+  if (FAILED(selection.range->IsEmpty(ecReadOnly, &empty)) || !empty) {
+    weasel::ghost::TraceLine(L"snapshot hidden: non-empty selection");
+    return false;
+  }
+
+  com_ptr<ITfRangeACP> acp_range;
+  LONG caret_pos = -1;
+  LONG selection_length = 0;
+  if (FAILED(selection.range->QueryInterface(IID_ITfRangeACP,
+                                             (LPVOID*)&acp_range)) ||
+      acp_range == nullptr ||
+      FAILED(acp_range->GetExtent(&caret_pos, &selection_length)) ||
+      caret_pos < 0 || selection_length != 0) {
+    weasel::ghost::TraceLine(L"snapshot hidden: ACP range unavailable");
+    return false;
+  }
+
+  LONG context_start = max(
+      0L, static_cast<LONG>(caret_pos - weasel::ghost::kDefaultContextChars));
+  LONG context_length = caret_pos - context_start;
+  if (FAILED(acp_range->SetExtent(context_start, context_length))) {
+    weasel::ghost::TraceLine(L"snapshot hidden: ACP context set failed");
+    return false;
+  }
+
+  wchar_t buffer[weasel::ghost::kDefaultContextChars]{};
+  ULONG prefix_length = 0;
+  if (FAILED(acp_range->GetText(ecReadOnly, 0, buffer,
+                                weasel::ghost::kDefaultContextChars,
+                                &prefix_length))) {
+    weasel::ghost::TraceLine(L"snapshot hidden: get text failed");
+    return false;
+  }
+
+  RECT rect{};
+  com_ptr<ITfContextView> context_view;
+  if (SUCCEEDED(pContext->GetActiveView(&context_view)) &&
+      context_view != nullptr) {
+    BOOL clipped = FALSE;
+    context_view->GetTextExt(ecReadOnly, selection.range, &rect, &clipped);
+  }
+  if (rect.left == 0 && rect.top == 0) {
+    POINT caret_point{};
+    HWND foreground = GetForegroundWindow();
+    if (foreground && GetCaretPos(&caret_point) &&
+        ClientToScreen(foreground, &caret_point)) {
+      rect = {caret_point.x, caret_point.y, caret_point.x + 2,
+              caret_point.y + 20};
+    }
+  }
+  if (rect.left == 0 && rect.top == 0) {
+    weasel::ghost::TraceLine(L"snapshot hidden: caret rect unavailable");
+    return false;
+  }
+
+  if (prefix != nullptr)
+    prefix->assign(buffer, prefix_length);
+  if (caret != nullptr)
+    *caret = caret_pos;
+  if (caret_rect != nullptr)
+    *caret_rect = rect;
+  return true;
+}
+
+// [GHOST-TSF-011 SNAPSHOT-COLLECTOR] in-process engine variant
 void WeaselTSF::_UpdateGhostSnapshot(ITfContext* pContext,
                                      TfEditCookie ecReadOnly) {
   LlmLog(L"snapshot enter pending=" + std::to_wstring(_expSnapshotPending) +
@@ -302,74 +381,10 @@ void WeaselTSF::_UpdateGhostSnapshot(ITfContext* pContext,
   if (!m_ghostEngine)
     return;
 
-  TF_SELECTION selection{};
-  ULONG selection_count = 0;
-  if (FAILED(pContext->GetSelection(ecReadOnly, TF_DEFAULT_SELECTION, 1,
-                                    &selection, &selection_count)) ||
-      selection_count < 1 || selection.range == nullptr) {
-    weasel::ghost::TraceLine(L"snapshot hidden: no selection");
-    _HideGhostPrediction();
-    return;
-  }
-
-  BOOL empty = TRUE;
-  if (FAILED(selection.range->IsEmpty(ecReadOnly, &empty)) || !empty) {
-    weasel::ghost::TraceLine(L"snapshot hidden: non-empty selection");
-    _HideGhostPrediction();
-    return;
-  }
-
-  com_ptr<ITfRangeACP> acp_range;
+  std::wstring prefix;
   LONG caret = -1;
-  LONG selection_length = 0;
-  if (FAILED(selection.range->QueryInterface(IID_ITfRangeACP,
-                                             (LPVOID*)&acp_range)) ||
-      acp_range == nullptr ||
-      FAILED(acp_range->GetExtent(&caret, &selection_length)) ||
-      caret < 0 || selection_length != 0) {
-    weasel::ghost::TraceLine(L"snapshot hidden: ACP range unavailable");
-    _HideGhostPrediction();
-    return;
-  }
-
-  LONG context_start = max(
-      0L, static_cast<LONG>(caret - weasel::ghost::kDefaultContextChars));
-  LONG context_length = caret - context_start;
-  if (FAILED(acp_range->SetExtent(context_start, context_length))) {
-    weasel::ghost::TraceLine(L"snapshot hidden: ACP context set failed");
-    _HideGhostPrediction();
-    return;
-  }
-
-  wchar_t prefix[weasel::ghost::kDefaultContextChars]{};
-  ULONG prefix_length = 0;
-  if (FAILED(acp_range->GetText(
-          ecReadOnly, 0, prefix, weasel::ghost::kDefaultContextChars,
-          &prefix_length))) {
-    weasel::ghost::TraceLine(L"snapshot hidden: get text failed");
-    _HideGhostPrediction();
-    return;
-  }
-
   RECT caret_rect{};
-  com_ptr<ITfContextView> context_view;
-  if (SUCCEEDED(pContext->GetActiveView(&context_view)) &&
-      context_view != nullptr) {
-    BOOL clipped = FALSE;
-    context_view->GetTextExt(ecReadOnly, selection.range,
-                             &caret_rect, &clipped);
-  }
-  if (caret_rect.left == 0 && caret_rect.top == 0) {
-    POINT caret_point{};
-    HWND foreground = GetForegroundWindow();
-    if (foreground && GetCaretPos(&caret_point) &&
-        ClientToScreen(foreground, &caret_point)) {
-      caret_rect = {caret_point.x, caret_point.y, caret_point.x + 2,
-                    caret_point.y + 20};
-    }
-  }
-  if (caret_rect.left == 0 && caret_rect.top == 0) {
-    weasel::ghost::TraceLine(L"snapshot hidden: caret rect unavailable");
+  if (!_ReadGhostPrefix(pContext, ecReadOnly, &prefix, &caret, &caret_rect)) {
     _HideGhostPrediction();
     return;
   }
@@ -377,16 +392,40 @@ void WeaselTSF::_UpdateGhostSnapshot(ITfContext* pContext,
   weasel::ghost::Snapshot snapshot;
   snapshot.document_token = reinterpret_cast<uint64_t>(pContext);
   snapshot.caret = caret;
-  snapshot.prefix.assign(prefix, prefix_length);
+  snapshot.prefix = prefix;
   snapshot.context_hash = weasel::ghost::HashContext(
       snapshot.document_token, snapshot.caret, snapshot.prefix);
   snapshot.caret_rect = caret_rect;
   weasel::ghost::TraceLine(
       L"snapshot accepted; prefix_chars=" +
-      std::to_wstring(prefix_length) + L"; prefix=" + snapshot.prefix);
+      std::to_wstring(snapshot.prefix.size()) + L"; prefix=" + snapshot.prefix);
   LlmLog(L"snapshot accepted prefix=" + snapshot.prefix);
   m_ghostEngine->OnSnapshot(snapshot);
   _expSnapshotPending = FALSE;
+}
+
+// [GHOST-020 STALE-DROP] A snapshot is only collected after an IME commit, so
+// edits made by plain typing, backspace or spaces never reached the engine and
+// it kept advertising a prediction for text that had already moved on - Tab
+// then inserted that stale text. Compare the caret prefix against what the
+// prediction was made for and drop it as soon as they differ. Composing is
+// skipped on purpose: while the user is typing pinyin the document itself is
+// unchanged and the constrained preview must survive.
+void WeaselTSF::_SyncGhostDocument(ITfContext* pContext,
+                                   TfEditCookie ecReadOnly) {
+  if (!m_ghostEngine)
+    return;
+  if (_IsComposing() || _status.composing)
+    return;
+
+  std::wstring prefix;
+  LONG caret = -1;
+  RECT caret_rect{};
+  if (!_ReadGhostPrefix(pContext, ecReadOnly, &prefix, &caret, &caret_rect)) {
+    _HideGhostPrediction();
+    return;
+  }
+  m_ghostEngine->OnDocumentPrefix(prefix);
 }
 
 void WeaselTSF::_SetGhostPreedit(const std::wstring& preedit) {

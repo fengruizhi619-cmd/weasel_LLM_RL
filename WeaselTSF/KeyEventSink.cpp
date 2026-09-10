@@ -212,6 +212,13 @@ bool WeaselTSF::_TryCommitPrediction(ITfContext* pContext, WPARAM wParam, BOOL* 
   if (wParam != VK_TAB) return false;
   std::wstring text;
   if (!_cand || !_cand->GetPrediction(text) || text.empty()) return false;
+  // [GHOST-020] The candidate list refreshes from the engine on a 500 ms timer,
+  // so it can still hold a prediction the engine has already dropped. Only
+  // insert the text when the engine still reports exactly this prediction.
+  if (!m_ghostEngine || m_ghostEngine->VisiblePrediction() != text) {
+    _cand->ClearPrediction();
+    return false;
+  }
   _cand->ClearPrediction();
   LlmLog(L"tab commit len=" + std::to_wstring(text.size()));
   _HideGhostPrediction();

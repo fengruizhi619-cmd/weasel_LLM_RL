@@ -609,6 +609,23 @@ class Engine {
     return Decision::Ignore;
   }
 
+  // [GHOST-020 STALE-DROP] The visible continuation is only valid for the
+  // document it was produced from. The TSF only re-reads the document after an
+  // IME commit, so plain typing, backspace or spaces left the old prediction in
+  // place and Tab kept inserting text that no longer belonged on screen.
+  // The TSF now reports the caret prefix on every edit; anything that does not
+  // match what the prediction was made for is dropped.
+  void OnDocumentPrefix(const std::wstring& prefix) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (visible_text_.empty())
+      return;
+    if (visible_snapshot_.prefix == prefix)
+      return;
+    visible_text_.clear();
+    visible_snapshot_ = Snapshot{};
+    LlmLog(L"engine prediction dropped: document prefix changed");
+  }
+
   // [TREE-010 PINYIN] Latest Rime composition (pinyin) for the current input
   // session. When non-empty, the visible continuation is constrained to
   // candidates whose pinyin starts with it.
@@ -625,7 +642,22 @@ class Engine {
     std::lock_guard<std::mutex> lock(mutex_);
     if (normalized == preedit_)
       return;
+    const bool composing_started = preedit_.empty() && !normalized.empty();
     preedit_ = normalized;
+    if (composing_started) {
+      // [TREE-016 PINYIN-SEED] A composition just started. The tree on hand was
+      // grown from context alone, so its first level almost never holds a
+      // syllable matching what is being typed. Drop the visible text and ask the
+      // worker to rebuild the tree with the pinyin filter on the depth-0 fetch.
+      // The reset happens on the worker thread on purpose: doing it here could
+      // race an in-flight growth pass.
+      visible_text_.clear();
+      visible_snapshot_ = Snapshot{};
+      pinyin_seed_ = true;
+      pending_ = true;
+      condition_.notify_all();
+      return;
+    }
     if (VisibleLocked())
       TryMatchLocked(visible_snapshot_);
   }
@@ -815,6 +847,7 @@ class Engine {
       Snapshot snapshot;
       uint64_t generation = 0;
       bool has_pending = false;
+      bool seed = false;
       {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait_for(lock, std::chrono::milliseconds(500),
@@ -826,6 +859,8 @@ class Engine {
           generation = generation_;
           pending_ = false;
           has_pending = true;
+          seed = pinyin_seed_;
+          pinyin_seed_ = false;
         }
       }
 
@@ -855,7 +890,7 @@ class Engine {
       int start_node = -1;
       {
         std::lock_guard<std::mutex> tree_lock(tree_mutex_);
-        int matched = tree_.MatchPath(snapshot.prefix);
+        int matched = seed ? -1 : tree_.MatchPath(snapshot.prefix);
         if (matched >= 0) {
           int matched_depth = tree_.Depth(matched);
           start_node = tree_.PruneToRebased(matched, snapshot.prefix);
@@ -1432,6 +1467,9 @@ class Engine {
   std::atomic<int> idle_milliseconds_{kDefaultIdleMilliseconds};
   uint64_t generation_ = 0;
   bool pending_ = false;
+  // [TREE-016] Set when a composition starts: the worker rebuilds the tree so
+  // the root level is fetched with the pinyin constraint applied.
+  bool pinyin_seed_ = false;
   bool running_ = true;
 };
 

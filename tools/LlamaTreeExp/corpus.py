@@ -16,6 +16,10 @@ except Exception:  # pragma: no cover
 
 
 class CorpusWriter:
+    @staticmethod
+    def default_key_file(path):
+        return os.path.join(os.path.dirname(os.path.abspath(path)), "corpus.key")
+
     def __init__(self, path, key=None, key_file=None):
         self.path = path
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -23,8 +27,30 @@ class CorpusWriter:
         if not seed and key_file and os.path.exists(key_file):
             with open(key_file, "rb") as f:
                 seed = f.read()
+        # [CORPUS-002] Pin the key to a file next to the corpus.
+        # Deriving it from the environment alone meant that a different
+        # USERNAME, or a process launched from a different context, silently
+        # produced a second key - and everything written under the first one
+        # became unreadable. The oldest 14 records of diag/corpus.jsonl died
+        # exactly that way (AES-GCM InvalidTag, base64 and length intact).
+        # The legacy derivation is kept for the first run so already-written
+        # records stay readable, then frozen for good.
         if not seed:
-            seed = ("weasel-corpus-" + os.environ.get("USERNAME", "local")).encode("utf-8")
+            pinned = key_file or self.default_key_file(path)
+            if os.path.exists(pinned):
+                try:
+                    with open(pinned, "rb") as f:
+                        seed = f.read().strip()
+                except OSError:
+                    seed = None
+            if not seed:
+                seed = ("weasel-corpus-" +
+                        os.environ.get("USERNAME", "local")).encode("utf-8")
+                try:
+                    with open(pinned, "wb") as f:
+                        f.write(seed)
+                except OSError:
+                    pass
         if isinstance(seed, str):
             seed = seed.encode("utf-8")
         self.key = hashlib.sha256(seed).digest()
