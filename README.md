@@ -212,6 +212,7 @@ WeaselServer 启动时读取 `%APPDATA%\Rime\ghost_mode.txt`，按模式拉起�
 
 | 版本 | 说明 |
 |---|---|
+| `cli_emojiless_RL_v1.4` | 在线与离线统一为逐 token 排名奖励（逐层相加，长度成为加分项） |
 | `cli_emojiless_RL_v1.3` | 拼音前缀匹配并全程生效、top-k 免建树训练、权重一致性保护、Tab 只提交有效预测 |
 | `cli_emojiless_RL_v1.2.1` | 安装器从 Release 拉模型（`-DownloadModels` / `-ModelsOnly` / `-Mirror`） |
 | `cli_emojiless_RL_v1.2` | 数据面板、无头离线训练与进度、入口去 cmd 窗口、脚本编码修复 |
