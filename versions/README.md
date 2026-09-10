@@ -16,8 +16,9 @@
 | cli_emojiless_RL_v1.1.zip | 离线记录模式、语言栏模式切换、兄弟节点批量前向 | v1.1 |
 | cli_emojiless_RL_v1.2.zip | 数据面板、无头离线训练与进度、入口去 cmd 窗口、脚本编码修复 | v1.2 |
 | cli_emojiless_RL_v1.2.1.zip | 安装器从 Release 拉模型（-DownloadModels / -ModelsOnly / -Mirror） | v1.2.1 |
+| cli_emojiless_RL_v1.3.zip | 拼音前缀匹配、top-k 免建树训练、checkpoint 同步防覆盖、Tab 防僵尸预测 | v1.3 |
 
 **当前工作树**
-- 基座：cli_emojiless_RL_v1.2.1（HEAD）
+- 基座：cli_emojiless_RL_v1.3（HEAD）
 - 活动实验：tools\LlamaTreeExp + tools\WeaselExpContextV0（外部钩子/候选树/RL）
-- 下一步：模型资产已进 Release，安装器一键拉取；继续长期使用积累在线 RL 梯度
+- 下一步：训练已提速（top-k 免建树，约 16-27 步/秒），继续长期使用积累语料；在线与离线共享同一份头，保存前会先采纳磁盘上更新的权重
