@@ -42,6 +42,28 @@ class Node:
     def is_root(self): return self.parent is None
 
 
+def rank_reward(rank, total, scheme="harmonic"):
+    """[TRAIN-024] Reward for a token the model ranked |rank| (0-based) among the
+    |total| reachable candidates at that step.
+
+    Rank the reachable candidates by cumulative probability, pay the token by
+    where it landed, and add the per-token rewards up along the sequence - so a
+    longer correct run is worth MORE, not less. The old score multiplied
+    probabilities together (cum ~ 0.3**10 = 6e-6 for ten correct characters),
+    which made long hits invisible next to a single-character hit.
+
+      harmonic : 1, 1/2, 1/3, 1/4, 1/5 ...
+      linear   : (total-rank)/total
+      exp      : 1, 1/2, 1/4, 1/8 ...
+    """
+    r = max(0, int(rank))
+    if scheme == "linear":
+        return float(max(0, int(total) - r)) / float(max(1, int(total)))
+    if scheme == "exp":
+        return 2.0 ** (-r)
+    return 1.0 / float(r + 1)
+
+
 def is_punct(t):
     return any(unicodedata.category(c).startswith("P") for c in t)
 
@@ -341,16 +363,19 @@ class TreeEngine:
         return loss.item()
 
     def train_sequence(self, prompt_text, target_text, k=20, grad_clip=1.0,
-                       miss_weight=0.3, dry_run=False):
+                       miss_weight=0.3, dry_run=False, scheme="harmonic"):
         """[TRAIN-020 TOPK] Rank-scored RL over one run of real text.
 
         Training does not need the display tree. One frozen-backbone prefill,
         then one single-token decode per character: for every step the trainable
-        head is asked for its top-k next characters, and the character the user
-        actually typed is matched against that list. The reward grows with the
-        probability and with the rank (the earlier it appears, the more it is
-        worth). A miss still produces a step - the wrong top-1 is pushed down -
-        so no recorded text is thrown away.
+        head is asked for its top-k next characters - those are the reachable
+        candidates - and the character the user actually typed is scored by its
+        RANK among them (see rank_reward). Every token gets its own reward and
+        its own step, so the rewards simply add up along the sequence and longer
+        correct runs are worth more.
+
+        A miss still produces a step - the wrong top-1 is pushed down - so no
+        recorded text is thrown away.
 
         The backbone is frozen, so its KV cache stays valid across the head
         updates and the walk costs one token per step.
@@ -383,7 +408,7 @@ class TreeEngine:
                 match = (top_id == target_id).nonzero(as_tuple=True)[0]
                 rank = int(match[0].item()) if match.numel() else -1
                 if rank >= 0:
-                    reward = float(top_p[rank]) * (1.0 - rank / float(top_id.shape[0]))
+                    reward = rank_reward(rank, int(top_id.shape[0]), scheme)
                 else:
                     reward = 0.0
 

@@ -61,6 +61,39 @@ def find_best_reward(root, typed_text):
     return best, best_path
 
 
+def rank_reward_path(root, typed_text, scheme="harmonic", max_len=24):
+    """[TRAIN-024] Per-token rank reward along the tree.
+
+    Walks |typed_text| down the tree; at every step ranks the node's children by
+    cumulative probability and pays the matched child by its rank. Returns
+    (tokens, ranks, rewards, total) where total is the sum of the per-token
+    rewards - the sequence score the user described: for a-b-c-d it is
+    g(rank_b) + g(rank_c) + g(rank_d).
+    """
+    if root is None or not typed_text:
+        return [], [], [], 0.0
+    tokens, ranks, rewards = [], [], []
+    node = root
+    for ch in typed_text[:max_len]:
+        kids = [c for c in node.children if c.tok and not c.is_leaf]
+        if not kids:
+            break
+        kids.sort(key=lambda c: c.cum, reverse=True)
+        hit = None
+        for i, c in enumerate(kids):
+            if len(c.tok) == 1 and c.tok == ch:
+                hit = (i, c)
+                break
+        if hit is None:
+            break
+        i, child = hit
+        tokens.append(child.tok)
+        ranks.append(i)
+        rewards.append(up.rank_reward(i, len(kids), scheme))
+        node = child
+    return tokens, ranks, rewards, float(sum(rewards))
+
+
 def top_path(root, max_len=24):
     """Highest cumulative-probability chain in the tree (the model's own guess).
 

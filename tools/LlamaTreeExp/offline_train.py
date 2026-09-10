@@ -67,6 +67,10 @@ def main():
                          "tree: legacy full-tree reward")
     ap.add_argument("--topk", type=int, default=20,
                     help="candidates compared against the typed character")
+    ap.add_argument("--rank-reward", choices=("harmonic", "linear", "exp"),
+                    default="harmonic",
+                    help="how a token's rank among the reachable candidates is "
+                         "turned into reward (see rank_reward)")
     ap.add_argument("--miss-weight", type=float, default=0.3,
                     help="weight of the negative step taken when the typed "
                          "character is not in the top-k")
@@ -90,12 +94,14 @@ def main():
         print("[offline] resumed updates=%d" % ckpt.updates, flush=True)
 
     steps = hits = 0
+    total_reward = 0.0
     total = len(todo)
     for epoch in range(max(1, args.epochs)):
         for index, rec in enumerate(todo):
             if (index + 1) % 25 == 0 or index + 1 == total:
-                print("[progress] %d/%d hits=%d steps=%d"
-                      % (index + 1, total, hits, steps), flush=True)
+                print("[progress] %d/%d hits=%d steps=%d reward=%.1f (%.3f/命中)"
+                      % (index + 1, total, hits, steps, total_reward,
+                         total_reward / hits if hits else 0.0), flush=True)
             ctx = rec.get("ctx", "")
             segment = rec.get("segment", "")
             kind = rec.get("kind", "commit")
@@ -113,10 +119,11 @@ def main():
                         run_prompt, run_target = ctx, segment
                     if not run_target:
                         continue
-                    n_steps, n_hits, _ = engine.train_sequence(
+                    n_steps, n_hits, reward_sum = engine.train_sequence(
                         run_prompt, run_target, k=args.topk,
                         grad_clip=args.grad_clip, miss_weight=args.miss_weight,
-                        dry_run=args.dry_run)
+                        dry_run=args.dry_run, scheme=args.rank_reward)
+                    total_reward += reward_sum
                     steps += n_steps
                     hits += n_hits
                     if n_steps and not args.dry_run:
@@ -176,8 +183,9 @@ def main():
         # still advanced the marker would silently throw the data away.
         with io.open(args.seen, "w", encoding="utf-8") as f:
             f.write(str(len(records)))
-    print("[offline] done: steps=%d hits=%d updates=%d" % (steps, hits, ckpt.updates),
-          flush=True)
+    print("[offline] done: steps=%d hits=%d reward=%.1f (%.3f/hit) updates=%d"
+          % (steps, hits, total_reward,
+             total_reward / hits if hits else 0.0, ckpt.updates), flush=True)
     return 0
 
 

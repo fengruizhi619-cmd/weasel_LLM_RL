@@ -624,6 +624,26 @@ class EngineService:
             # weights changed -> every cached logit is stale
             self.logits_cache.clear()
 
+    # ---------- [TRAIN-025] same training mode as the offline pass ----------
+    def train_sequence_step(self, context, typed):
+        """Per-token rank rewards over a KV-cached walk - exactly the routine the
+        offline trainer uses, so both paths score and update the same way."""
+        with self.lock:
+            t0 = time.perf_counter()
+            steps = hits = 0
+            reward_sum = 0.0
+            try:
+                steps, hits, reward_sum = self.engine.train_sequence(
+                    context, typed, k=self.args.topk,
+                    grad_clip=self.args.grad_clip,
+                    miss_weight=self.args.miss_weight,
+                    scheme=self.args.rank_reward)
+            except Exception as exc:
+                print(f"[RL] sequence step failed: {exc!r}", flush=True)
+            elapsed = time.perf_counter() - t0
+            self.reset_cache()
+            return steps, hits, reward_sum, elapsed
+
     # ---------- S5: guarded RL step ----------
     def rl_step(self, context, typed, reward, negative=False):
         with self.lock:
@@ -745,12 +765,15 @@ class RLLoop(threading.Thread):
                 reward, path = self._score_accept(typed, shown)
                 if reward > 0:
                     service.metrics.bump("rl_rewards")
-                    service.corpus.write({"kind": "accept",
-                                          "ctx": self.prev_context,
-                                          "typed": path, "reward": reward,
-                                          "shown": bool(shown),
-                                          "time": time.time()})
-                    self._enqueue(("accept", self.prev_context, path, reward))
+                # [TRAIN-025] Train on the full typed text, not just the tree
+                # path that happened to match, and do it for every commit - the
+                # offline pass behaves the same way and a miss is a signal too.
+                service.corpus.write({"kind": "accept",
+                                      "ctx": self.prev_context,
+                                      "typed": typed, "reward": reward,
+                                      "shown": bool(shown),
+                                      "time": time.time()})
+                self._enqueue(("accept", self.prev_context, typed, reward))
             else:
                 # P3-1: classify the rejection instead of treating every
                 # backspace the same.
@@ -814,9 +837,18 @@ class RLLoop(threading.Thread):
                 # queue empty -> hand reserved blocks back to the driver
                 torch.cuda.empty_cache()
             kind, ctx, text, weight = self.pending.pop(0)
+            if kind == "accept":
+                steps, hits, rsum, elapsed = service.train_sequence_step(ctx, text)
+                if not steps:
+                    continue
+                service.ckpt.mark_dirty()
+                service.metrics.bump("rl_updates", steps)
+                print(f"[RL] accept text={text!r} steps={steps} hits={hits} "
+                      f"reward={rsum:.3f} {elapsed*1000:.0f}ms "
+                      f"pending={len(self.pending)}", flush=True)
+                continue
             try:
-                loss, elapsed = service.rl_step(
-                    ctx, text, weight, negative=(kind == "reject"))
+                loss, elapsed = service.rl_step(ctx, text, weight, negative=True)
             except Exception as exc:
                 print(f"[RL] step failed: {exc!r}", flush=True)
                 continue
@@ -824,7 +856,7 @@ class RLLoop(threading.Thread):
                 continue
             service.ckpt.mark_dirty()
             service.metrics.bump("rl_updates")
-            print(f"[RL] {kind} text={text!r} w={weight:.4f} "
+            print(f"[RL] reject text={text!r} w={weight:.4f} "
                   f"loss={loss:.4f} {elapsed*1000:.0f}ms "
                   f"pending={len(self.pending)}", flush=True)
         self.since_eval += 1
@@ -934,6 +966,12 @@ def main():
     ap.add_argument("--ctx-chars", type=int, default=100)
     ap.add_argument("--idle-gate", type=float, default=0.3)
     ap.add_argument("--grad-clip", type=float, default=1.0)
+    # [TRAIN-025] The live path and the offline pass must score identically -
+    # the offline pass only gets to be cheaper about it.
+    ap.add_argument("--topk", type=int, default=20)
+    ap.add_argument("--rank-reward", choices=("harmonic", "linear", "exp"),
+                    default="harmonic")
+    ap.add_argument("--miss-weight", type=float, default=0.3)
     ap.add_argument("--step-timeout", type=float, default=2.0)
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--rollback-margin", type=float, default=0.05)
