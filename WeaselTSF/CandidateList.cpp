@@ -270,6 +270,13 @@ void CCandidateList::Destroy() {
   // EndUI();
   Show(FALSE);
   _DisposeUIWindow();
+  // [GHOST-021] The panel window is created in StartUI() and destroyed here, so
+  // once we reach this point an armed prediction can no longer be SEEN - yet it
+  // stayed committable, which is exactly the "no candidate box but Tab still
+  // completes" report. A prediction may only outlive the UI while it is visible.
+  _predictionActive = false;
+  _predictionText.clear();
+  _lastPredictionMtime = -1;
 }
 
 void CCandidateList::DestroyAll() {
@@ -277,6 +284,10 @@ void CCandidateList::DestroyAll() {
   // EndUI();
   Show(FALSE);
   _DisposeUIWindowAll();
+  // [GHOST-021] see Destroy()
+  _predictionActive = false;
+  _predictionText.clear();
+  _lastPredictionMtime = -1;
 }
 UIStyle& CCandidateList::style() {
   // return _ui->style();
@@ -496,6 +507,16 @@ bool CCandidateList::GetPrediction(std::wstring& out) const {
   if (!_predictionActive || _predictionText.empty()) { out.clear(); return false; }
   out = _predictionText;
   return true;
+}
+
+// [GHOST-021] Accept a prediction only while its window is really on screen.
+// _predictionActive merely says we armed it - the panel can be disposed (then
+// UIImpl::Show()/Hide() are no-ops and `shown` goes stale) or hidden by the
+// host, and IsWindowVisible() is the only honest answer to "can the user see it".
+bool CCandidateList::PredictionOnScreen() {
+  if (!_predictionActive || _predictionText.empty())
+    return false;
+  return _ui && _ui->IsVisibleOnScreen();
 }
 
 void CCandidateList::ClearPrediction() {

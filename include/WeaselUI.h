@@ -49,6 +49,8 @@ class UI {
   void ShowWithTimeout(size_t millisec);
   bool IsCountingDown() const;
   bool IsShown() const;
+  // [GHOST-021] true only while the candidate panel really is on screen.
+  bool IsVisibleOnScreen() const;
 
   // 重绘界面
   void Refresh();

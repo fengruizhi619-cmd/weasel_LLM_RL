@@ -66,3 +66,4 @@ tools/LlamaTreeExp/__pycache__/
 models/
 llama.cpp/
 ghost_home.txt
+build_rime/

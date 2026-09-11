@@ -6,9 +6,12 @@
 ## 一键启动
 
 ```
-start-online.cmd     启动 WeaselServer + 上下文钩子 + 引擎服务(8081)
-stop-online.cmd      停引擎和钩子，WeaselServer 保持运行
+watchdog.vbs -> watchdog.ps1   开机/每 5 分钟：拉起 WeaselServer、上下文钩子、采集器
+ghost_service.cmd              WeaselServer 拉起引擎服务(8081)或采集器（按 ghost_mode.txt）
+ghost_data_panel.cmd           数据面板：累计条数 + 离线训练入口
 ```
+
+启动与停止由系统计划任务 `WeaselOnlineWatchdog` 负责，不再需要手工脚本。
 
 ## 接口
 
@@ -28,9 +31,9 @@ stop-online.cmd      停引擎和钩子，WeaselServer 保持运行
 | --dtype | float16 | 主干精度（头恒为 fp32） |
 | -n/--width | 20 | 候选树宽度 |
 | -d/--depth | 2 | 候选树深度 |
-| --rl-lr | 1e-4 | 单样本 SGD 学习率 |
+| --rl-lr | 1e-5 | 单样本 SGD 学习率（纯交叉熵，切勿调大） |
 | --idle-gate | 0.3 | 距上次请求不足该秒数则不训练（S5） |
-| --grad-clip | 1.0 | 梯度范数裁剪（S5） |
+| --grad-clip | 0 | 梯度范数裁剪，0 = 关闭（开启会抹平步长差异） |
 | --step-timeout | 2.0 | 单步超时则回滚该步（S5） |
 | --eval-every | 50 | 每 N 次更新做一次回归探针（S5） |
 | --rollback-margin | 0.05 | 探针低于基线该幅度则回滚到 t2h 槽（S5） |

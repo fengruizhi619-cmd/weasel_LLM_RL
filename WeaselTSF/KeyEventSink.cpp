@@ -219,6 +219,14 @@ bool WeaselTSF::_TryCommitPrediction(ITfContext* pContext, WPARAM wParam, BOOL* 
     _cand->ClearPrediction();
     return false;
   }
+  // [GHOST-021] Refuse to insert text the user cannot see. UIImpl::Show() is a
+  // no-op while the panel window is gone, so "prediction exists" is not the
+  // same as "prediction is on screen".
+  if (!_cand->PredictionOnScreen()) {
+    LlmLog(L"tab ignored: prediction is not on screen");
+    _cand->ClearPrediction();
+    return false;
+  }
   _cand->ClearPrediction();
   LlmLog(L"tab commit len=" + std::to_wstring(text.size()));
   _HideGhostPrediction();

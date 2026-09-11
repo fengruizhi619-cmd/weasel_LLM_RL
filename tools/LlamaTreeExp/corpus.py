@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import os
+import sys
 
 try:
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -74,11 +75,14 @@ class CorpusWriter:
         out = []
         if not os.path.exists(self.path):
             return out
+        bad = 0
+        total = 0
         with open(self.path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
+                total += 1
                 try:
                     data = base64.b64decode(line)
                     if self.aead:
@@ -87,5 +91,13 @@ class CorpusWriter:
                         raw = self._xor(data)
                     out.append(json.loads(raw.decode("utf-8")))
                 except Exception:
+                    bad += 1
                     continue
+        if bad:
+            # [CORPUS-003] Silence here is a trap: before the key was pinned to
+            # a file it could change with the environment, and then every record
+            # of a healthy-looking file fails to decrypt and the caller just
+            # sees an empty corpus with no explanation.
+            print("[corpus] %d/%d 条记录无法解密，已跳过：%s"
+                  % (bad, total, self.path), file=sys.stderr, flush=True)
         return out

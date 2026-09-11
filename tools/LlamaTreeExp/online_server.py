@@ -39,6 +39,7 @@ import torch.nn.functional as F
 
 torch.set_float32_matmul_precision("high")
 
+import ctxwin
 from corpus import CorpusWriter
 import unified_pipeline as up
 import unified_watcher as uw
@@ -100,7 +101,7 @@ def tree_predicts(root, text):
     return False
 
 
-def classify_backspace(prev_ctx, ctx, trees):
+def classify_backspace(prev_ctx, ctx, trees, deleted=None):
     """P3-1: tell apart the three rejection shapes.
 
     Returns (kind, deleted, weight):
@@ -110,15 +111,22 @@ def classify_backspace(prev_ctx, ctx, trees):
     """
     if not prev_ctx or not ctx or prev_ctx == ctx:
         return "", "", 0.0
-    common = common_prefix_len(prev_ctx, ctx)
-    if common == len(ctx):
-        deleted = prev_ctx[len(ctx):]
-        # The text may have been predicted by the tree in force one or two
-        # commits ago, so check every recent tree.
-        if any(tree_predicts(tree, deleted) for tree in (trees or [])):
-            return "predicted-reject", deleted, 1.0
-        return "typing-reject", deleted, 0.3
-    return "replace", prev_ctx[common:], 0.5
+    if deleted is None:
+        # [CTX-001] Fallback only: the caller normally hands us the text from
+        # ctxwin, because this prefix test cannot see a deletion once the
+        # context window has started to slide.
+        common = common_prefix_len(prev_ctx, ctx)
+        if common == len(ctx):
+            deleted = prev_ctx[len(ctx):]
+        else:
+            return "replace", prev_ctx[common:], 0.5
+    if not deleted:
+        return "", "", 0.0
+    # The text may have been predicted by the tree in force one or two
+    # commits ago, so check every recent tree.
+    if any(tree_predicts(tree, deleted) for tree in (trees or [])):
+        return "predicted-reject", deleted, 1.0
+    return "typing-reject", deleted, 0.3
 
 
 class Metrics:
@@ -143,6 +151,7 @@ class Metrics:
         self.backspace_typing = 0
         self.backspace_replace = 0
         self.reject_too_long = 0
+        self.accept_too_long = 0
         self.batched_requests = 0
         self.batch_saved = 0
         self.accepted_chars = 0
@@ -408,7 +417,10 @@ class EngineService:
             if pinyin:
                 filtered = []
                 for item in entries:
-                    tp = token_pinyin(item["token"])
+                    # [CTX-004] token_pinyin was already run (and cached) when
+                    # the entry was built a few lines up - recomputing it here
+                    # put pypinyin on the request path for every candidate.
+                    tp = item["pinyin"]
                     # [S3] Two-way prefix match: the token may extend what is
                     # typed (tp.startswith) or be a prefix of it (head syllable
                     # "da" while the user is still at "daga"), otherwise a
@@ -631,18 +643,16 @@ class EngineService:
         with self.lock:
             t0 = time.perf_counter()
             steps = hits = 0
-            reward_sum = 0.0
+            loss_sum = 0.0
             try:
-                steps, hits, reward_sum = self.engine.train_sequence(
+                steps, hits, loss_sum = self.engine.train_sequence(
                     context, typed, k=self.args.topk,
-                    grad_clip=self.args.grad_clip,
-                    miss_weight=self.args.miss_weight,
-                    scheme=self.args.rank_reward)
+                    grad_clip=self.args.grad_clip)
             except Exception as exc:
                 print(f"[RL] sequence step failed: {exc!r}", flush=True)
             elapsed = time.perf_counter() - t0
             self.reset_cache()
-            return steps, hits, reward_sum, elapsed
+            return steps, hits, loss_sum, elapsed
 
     # ---------- S5: guarded RL step ----------
     def rl_step(self, context, typed, reward, negative=False):
@@ -656,15 +666,14 @@ class EngineService:
                                              self.args.grad_clip)
             elapsed = time.perf_counter() - t0
             if elapsed > self.args.step_timeout:
-                # P1-5: undo with the gradient instead of keeping a 620MB
-                # copy of the fp32 head around for every single step.
-                grad = self.engine.model.lm_head.weight.grad
-                if grad is not None:
-                    with torch.no_grad():
-                        self.engine.model.lm_head.weight.add_(
-                            grad, alpha=self.engine.optimizer.param_groups[0]["lr"])
-                self.reset_cache()
-                return None, elapsed
+                # [TRAIN-028] This used to "undo" the step by adding back
+                # lr * grad - which is only the SGD update rule. With AdamW the
+                # applied step is a normalised one, so that would corrupt the
+                # weights instead of reverting them. AdamW also bounds each step
+                # by its learning rate, so a slow step is no longer dangerous;
+                # just record it.
+                print(f"[RL] slow step {elapsed*1000:.0f}ms (kept, AdamW)",
+                      flush=True)
             self.reset_cache()
             return loss, elapsed
 
@@ -723,12 +732,21 @@ class RLLoop(threading.Thread):
                 size = os.path.getsize(log_file)
             except OSError:
                 continue
+            if size < pos:
+                # the hook restarted / the log was rotated
+                pos = 0
             if size <= pos:
                 continue
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            # [CTX-002] complete lines only, and advance by what we consumed -
+            # see the same fix in offline_recorder.run().
+            with open(log_file, "rb") as f:
                 f.seek(pos)
-                chunk = f.read()
-            pos = os.path.getsize(log_file)
+                data = f.read()
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                continue
+            chunk = data[:cut + 1].decode("utf-8", "replace")
+            pos += cut + 1
             for line in chunk.splitlines():
                 if "[focus]" in line:
                     # P0-1b: a new focused document. Comparing the previous
@@ -760,8 +778,15 @@ class RLLoop(threading.Thread):
         service.metrics.bump("commits")
         if self.prev_context is not None:
             shown = service.take_shown()          # P0-3
-            if ctx.startswith(self.prev_context):
-                typed = ctx[len(self.prev_context):]
+            # [CTX-001] Compare on the overlap, not on the prefix (see
+            # ctxwin.py). The hook sends the last N characters, so once the
+            # document is longer than N the window slides and prev stops being
+            # a prefix of ctx on every plain append - which is how the online
+            # loop ended up producing no reward at all for long documents.
+            change, changed = ctxwin.classify_change(
+                self.prev_context, ctx, self.args.max_change)
+            if change == "append" and len(changed) <= self.args.max_accept_chars:
+                typed = changed
                 reward, path = self._score_accept(typed, shown)
                 if reward > 0:
                     service.metrics.bump("rl_rewards")
@@ -775,10 +800,17 @@ class RLLoop(threading.Thread):
                                       "time": time.time()})
                 self._enqueue(("accept", self.prev_context, typed, reward))
             else:
+                if change == "append":
+                    # a paste or a select-all retype: real text, but not
+                    # typing, and one training step per character would hold
+                    # the model lock for minutes
+                    service.metrics.bump("accept_too_long")
                 # P3-1: classify the rejection instead of treating every
-                # backspace the same.
+                # backspace the same. [CTX-001] hand over the text ctxwin
+                # computed, otherwise a long document cannot report a deletion.
                 kind, rejected, weight = classify_backspace(
-                    self.prev_context, ctx, self.recent_trees)
+                    self.prev_context, ctx, self.recent_trees,
+                    deleted=changed if change == "delete" else None)
                 if kind:
                     service.metrics.bump("rl_backspaces")
                     if kind == "predicted-reject":
@@ -838,13 +870,13 @@ class RLLoop(threading.Thread):
                 torch.cuda.empty_cache()
             kind, ctx, text, weight = self.pending.pop(0)
             if kind == "accept":
-                steps, hits, rsum, elapsed = service.train_sequence_step(ctx, text)
+                steps, hits, lsum, elapsed = service.train_sequence_step(ctx, text)
                 if not steps:
                     continue
                 service.ckpt.mark_dirty()
                 service.metrics.bump("rl_updates", steps)
                 print(f"[RL] accept text={text!r} steps={steps} hits={hits} "
-                      f"reward={rsum:.3f} {elapsed*1000:.0f}ms "
+                      f"loss={lsum:.3f} {elapsed*1000:.0f}ms "
                       f"pending={len(self.pending)}", flush=True)
                 continue
             try:
@@ -965,13 +997,11 @@ def main():
     ap.add_argument("-d", "--depth", type=int, default=2)
     ap.add_argument("--ctx-chars", type=int, default=100)
     ap.add_argument("--idle-gate", type=float, default=0.3)
-    ap.add_argument("--grad-clip", type=float, default=1.0)
+    # [CTX-008] 0 = off (see the note in train_text_corpus.py)
+    ap.add_argument("--grad-clip", type=float, default=0.0)
     # [TRAIN-025] The live path and the offline pass must score identically -
     # the offline pass only gets to be cheaper about it.
     ap.add_argument("--topk", type=int, default=20)
-    ap.add_argument("--rank-reward", choices=("harmonic", "linear", "exp"),
-                    default="harmonic")
-    ap.add_argument("--miss-weight", type=float, default=0.3)
     ap.add_argument("--step-timeout", type=float, default=2.0)
     ap.add_argument("--eval-every", type=int, default=50)
     ap.add_argument("--rollback-margin", type=float, default=0.05)
@@ -985,6 +1015,10 @@ def main():
     ap.add_argument("--keys-per-char", type=float, default=3.5)
     ap.add_argument("--max-reject-chars", type=int, default=24,
                     help="ignore reject samples longer than this (document switches)")
+    ap.add_argument("--max-change", type=int, default=ctxwin.DEFAULT_MAX_CHANGE,
+                    help="bigger edits are pastes/document switches, not typing")
+    ap.add_argument("--max-accept-chars", type=int, default=48,
+                    help="never train on an accepted run longer than this")
     ap.add_argument("--batch-size", type=int, default=8,
                     help="max sibling requests merged into one forward")
     ap.add_argument("--batch-wait-ms", type=float, default=8.0)
@@ -1035,7 +1069,9 @@ def main():
         pass
     finally:
         loop.stop()
-        ckpt.save_epoch(force=True)
+        # [TRAIN-036] shutting down only guarantees the realtime slot; forcing
+        # all five would stamp the 2h/12h rollback points with the current head.
+        ckpt.save_epoch(force=True, slots=("lm_head_t0.pt",))
         server.server_close()
 
 

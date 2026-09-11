@@ -25,17 +25,11 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
+import ctxwin
 from corpus import CorpusWriter
 
 CTX_RE = re.compile(r"ctx\(\d+/\d+\):\s(.+?)\s*$")
 FOCUS_RE = re.compile(r"\[focus\] subscribed text-changed on (.+)$")
-
-
-def common_prefix_len(left, right):
-    n = 0
-    while n < len(left) and n < len(right) and left[n] == right[n]:
-        n += 1
-    return n
 
 
 class Recorder:
@@ -62,16 +56,16 @@ class Recorder:
             return
         if ctx == self.prev:
             return
-        common = common_prefix_len(self.prev, ctx)
-        if common == len(self.prev):
-            kind, segment = "commit", ctx[common:]
-        elif common == len(ctx):
-            kind, segment = "backspace", self.prev[common:]
-        else:
-            kind, segment = "replace", self.prev[common:]
+        # [CTX-001] See ctxwin.py. The old test here was "is prev a prefix of
+        # ctx", which silently stops holding once the document is longer than
+        # the context cap: the window slides and a plain append looks like a
+        # replacement. classify_change() compares on the overlap instead.
+        change, segment = ctxwin.classify_change(
+            self.prev, ctx, max_change=self.args.max_change)
+        kind = {"append": "commit", "delete": "backspace"}.get(change, change)
         if segment:
             self.writer.write({"t": time.time(), "app": self.app,
-                               "ctx": self.prev if kind != "commit" else self.prev,
+                               "ctx": self.prev,
                                "segment": segment, "kind": kind,
                                "ctx_len": len(self.prev)})
             if kind == "commit":
@@ -100,10 +94,19 @@ class Recorder:
                 pos = 0
             if size <= pos:
                 continue
-            with io.open(log_file, "r", encoding="utf-8", errors="replace") as f:
+            # [CTX-002] Read bytes and consume only COMPLETE lines. The old
+            # version read text from pos and then reset pos to the current file
+            # size, so anything appended during the read was skipped for good,
+            # and a half-written last line was parsed as if it were whole (the
+            # regex happily matches a truncated context).
+            with open(log_file, "rb") as f:
                 f.seek(pos)
-                chunk = f.read()
-            pos = os.path.getsize(log_file)
+                data = f.read()
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                continue
+            chunk = data[:cut + 1].decode("utf-8", "replace")
+            pos += cut + 1
             for line in chunk.splitlines():
                 if "[focus]" in line:
                     self.on_focus(line)
@@ -146,6 +149,9 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "diag", "segments.jsonl"))
     ap.add_argument("--stats", default=os.path.join(HERE, "diag", "segments_stats.jsonl"))
     ap.add_argument("--ctx-chars", type=int, default=256)
+    ap.add_argument("--max-change", type=int, default=ctxwin.DEFAULT_MAX_CHANGE,
+                    help="edits longer than this are pastes/document switches, "
+                         "not typing (see ctxwin.py)")
     args = ap.parse_args()
     if already_running():
         print("[recorder] another recorder is already running, exiting", flush=True)

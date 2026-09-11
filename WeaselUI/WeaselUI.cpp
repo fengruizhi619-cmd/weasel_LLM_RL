@@ -149,6 +149,14 @@ bool UI::IsShown() const {
   return pimpl_ && pimpl_->IsShown();
 }
 
+// [GHOST-021] UIImpl::Show()/Hide() both bail out when the panel window is gone,
+// so `shown` can stay stale at true after the window was destroyed. Ask Windows
+// instead: a window that exists and is visible really is on screen.
+bool UI::IsVisibleOnScreen() const {
+  return pimpl_ && pimpl_->panel.IsWindow() &&
+         ::IsWindowVisible(pimpl_->panel.m_hWnd) != FALSE;
+}
+
 void UI::Refresh() {
   if (pimpl_) {
     pimpl_->Refresh();

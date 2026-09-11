@@ -5,11 +5,9 @@ WeaselExpContextV0 log -> reward check on previous tree
 -> unified PyTorch RL update (lm_head) -> rebuild candidate tree
 -> multi-slot checkpoint persistence.
 """
-import argparse
 import torch
 import os
 import re
-import signal
 import sys
 import time
 
@@ -17,7 +15,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-import unified_pipeline as up
 
 CTX_RE = re.compile(r"ctx\(\d+/\d+\):\s(.+?)\s*$")
 
@@ -61,59 +58,6 @@ def find_best_reward(root, typed_text):
     return best, best_path
 
 
-def rank_reward_path(root, typed_text, scheme="harmonic", max_len=24):
-    """[TRAIN-024] Per-token rank reward along the tree.
-
-    Walks |typed_text| down the tree; at every step ranks the node's children by
-    cumulative probability and pays the matched child by its rank. Returns
-    (tokens, ranks, rewards, total) where total is the sum of the per-token
-    rewards - the sequence score the user described: for a-b-c-d it is
-    g(rank_b) + g(rank_c) + g(rank_d).
-    """
-    if root is None or not typed_text:
-        return [], [], [], 0.0
-    tokens, ranks, rewards = [], [], []
-    node = root
-    for ch in typed_text[:max_len]:
-        kids = [c for c in node.children if c.tok and not c.is_leaf]
-        if not kids:
-            break
-        kids.sort(key=lambda c: c.cum, reverse=True)
-        hit = None
-        for i, c in enumerate(kids):
-            if len(c.tok) == 1 and c.tok == ch:
-                hit = (i, c)
-                break
-        if hit is None:
-            break
-        i, child = hit
-        tokens.append(child.tok)
-        ranks.append(i)
-        rewards.append(up.rank_reward(i, len(kids), scheme))
-        node = child
-    return tokens, ranks, rewards, float(sum(rewards))
-
-
-def top_path(root, max_len=24):
-    """Highest cumulative-probability chain in the tree (the model's own guess).
-
-    Used as the negative target when the user typed something the tree did not
-    contain: that guess is what the head should be pushed away from.
-    """
-    text = ""
-    node = root
-    while node is not None and len(text) < max_len:
-        best = None
-        for child in node.children:
-            if not child.tok:
-                continue
-            if best is None or child.cum > best.cum:
-                best = child
-        if best is None:
-            break
-        text += best.tok
-        node = best
-    return text
 
 
 class CheckpointManager:
@@ -123,7 +67,18 @@ class CheckpointManager:
         self.ckpt_dtype = ckpt_dtype
         self.dirty = False
         self.updates = 0
+        # [TRAIN-036] Seed the schedule from the files on disk. These five slots
+        # are shared with the offline trainer, and a fresh process used to start
+        # with an empty table, so its very first save_epoch() saw every interval
+        # as already elapsed and wrote all five slots with the same head - which
+        # flattened the dilution ladder that maybe_rollback() depends on.
         self.last_save = {}
+        for _name, _interval in SLOTS:
+            try:
+                self.last_save[_name] = os.path.getmtime(
+                    os.path.join(ckpt_dir, _name))
+            except OSError:
+                pass
         # [P1-9] bookkeeping for sync_from_disk()
         self._last_write_ts = 0.0
         self._last_sync_check = 0.0
@@ -200,12 +155,20 @@ class CheckpointManager:
         self._last_write_ts = newest[1]
         return True
 
-    def save_epoch(self, force=False, lock=None):
+    def save_epoch(self, force=False, lock=None, slots=None):
+        """Write the slots that are due.
+
+        `force` bypasses the interval; `slots` restricts which ones are
+        considered, so a caller can insist on the realtime slot without also
+        stamping the day-old rollback points with a brand new head.
+        """
         adopted = self.sync_from_disk()
         if not self.dirty:
             return adopted
         now = time.time()
         for name, interval in SLOTS:
+            if slots is not None and name not in slots:
+                continue
             last = self.last_save.get(name, 0.0)
             if force or (now - last) >= interval:
                 self.engine.save_checkpoint(
@@ -216,131 +179,3 @@ class CheckpointManager:
         self.dirty = False
         return adopted
 
-
-def main():
-    ap = argparse.ArgumentParser(
-        description="cli_emojiless_exp_v0.2 unified full-chain watcher")
-    ap.add_argument("--log-file", required=True)
-    ap.add_argument("--model", default=up.MODEL_PATH)
-    ap.add_argument("--device", default=up.DEVICE)
-    ap.add_argument("--dtype", choices=["float32", "bfloat16", "float16"],
-                    default="bfloat16" if up.DEVICE == "cuda" else "float32")
-    ap.add_argument("--fp8", action="store_true")
-    ap.add_argument("--rl-lr", type=float, default=up.LR)
-    ap.add_argument("-n", type=int, default=up.WIDTH)
-    ap.add_argument("-d", type=int, default=up.DEPTH)
-    ap.add_argument("--top-n", type=int, default=up.TOP_N)
-    ap.add_argument("--ctx-chars", type=int, default=up.CTX_CHARS)
-    ap.add_argument("--ckpt-dir", default="")
-    args = ap.parse_args()
-
-    log_file = os.path.abspath(args.log_file)
-    ckpt_dir = args.ckpt_dir or os.path.join(
-        os.path.dirname(log_file), "checkpoints")
-
-    print("[v0.2] unified full-chain watcher: "
-          "context -> reward -> tree -> RL -> checkpoint", flush=True)
-    print(f"[v0.2] log={log_file} model={args.model} "
-          f"width={args.n} depth={args.d} lr={args.rl_lr}", flush=True)
-
-    engine = up.TreeEngine(args.model, lr=args.rl_lr, device=args.device,
-                           dtype=args.dtype, fp8=args.fp8)
-    ckpt = CheckpointManager(engine, ckpt_dir)
-    if ckpt.load_latest():
-        print(f"[v0.2] resumed updates={ckpt.updates}", flush=True)
-
-    if not os.path.exists(log_file):
-        open(log_file, "a", encoding="utf-8").close()
-    last_pos = os.path.getsize(log_file)
-
-    prev_context = None
-    prev_tree = None
-    commit_count = 0
-    running = True
-
-    def stop_handler(_sig, _frame):
-        nonlocal running
-        running = False
-    signal.signal(signal.SIGINT, stop_handler)
-
-    print("\n[v0.2] ready. Type Chinese with Weasel in another app.\n",
-          flush=True)
-
-    try:
-        while running:
-            time.sleep(0.1)
-            if not os.path.exists(log_file):
-                continue
-            cur_size = os.path.getsize(log_file)
-            if cur_size <= last_pos:
-                continue
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                f.seek(last_pos)
-                new_content = f.read()
-            last_pos = os.path.getsize(log_file)
-
-            for line in new_content.splitlines():
-                m = CTX_RE.search(line)
-                if not m:
-                    continue
-                ctx_text = m.group(1).strip()
-                if not ctx_text:
-                    continue
-                if len(ctx_text) > args.ctx_chars:
-                    ctx_text = ctx_text[-args.ctx_chars:]
-                if ctx_text == prev_context:
-                    continue
-                commit_count += 1
-
-                reward = 0.0
-                reward_path = ""
-                typed = ""
-                if prev_context and prev_tree:
-                    if ctx_text.startswith(prev_context):
-                        typed = ctx_text[len(prev_context):]
-                        reward, reward_path = find_best_reward(prev_tree, typed)
-                    else:
-                        print(f"[commit #{commit_count}] diverged, skip reward",
-                              flush=True)
-
-                rl_line = ""
-                if reward > 0.0 and typed:
-                    loss = engine.rl_update(prev_context, typed, reward)
-                    ckpt.mark_dirty()
-                    ckpt.save_epoch()
-                    rl_line = (f" reward={reward:.4f} path={reward_path!r} "
-                               f"loss={loss:.6f} updates={ckpt.updates}")
-
-                root, leaves, stats = engine.build_tree(
-                    ctx_text, args.n, args.d)
-
-                print(f"\n{'=' * 60}", flush=True)
-                print(f"[commit #{commit_count}] ctx={ctx_text!r}", flush=True)
-                print(f"[tree] {stats['time']:.2f}s "
-                      f"nodes={stats['nodes']} leaves={stats['leaves']} "
-                      f"forward_calls={stats.get('forward_calls', 0)}",
-                      flush=True)
-                if leaves:
-                    print(f"[top {min(3, len(leaves))}]:", flush=True)
-                    for i, leaf in enumerate(leaves[:3], 1):
-                        print(f"  {i}. P={leaf.cum:.6f} {leaf.path!r}",
-                              flush=True)
-                if rl_line:
-                    print(f"[RL]{rl_line}", flush=True)
-
-                prev_context = ctx_text
-                prev_tree = root
-
-                ckpt.save_epoch()
-
-    except Exception as exc:
-        print(f"[v0.2] [ERROR] {exc}", file=sys.stderr, flush=True)
-    finally:
-        ckpt.save_epoch(force=True)
-        print(f"\n[v0.2] stopped. commits={commit_count} "
-              f"rl_updates={ckpt.updates}", flush=True)
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

@@ -55,6 +55,7 @@ class CCandidateList : public ITfIntegratableCandidateListUIElement,
   void StartUI();
   void EndUI();
   bool GetPrediction(std::wstring& out) const;
+  bool PredictionOnScreen();
   void ClearPrediction();
 
   com_ptr<ITfContext> GetContextDocument();
