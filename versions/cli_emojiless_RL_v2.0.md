@@ -77,3 +77,16 @@ v1.4 -> v2.0 增量
   - experiments/mix_ratio.py         混料比例
   - experiments/domain_conflict.py   两个域的梯度夹角
   - experiments/backbone_head_train.py  Base vs Chat 骨干
+
+Release 资产（tag 与版本同名）
+
+  - Qwen3-0.6B-Base.zip.001 / .002 / .003   主干，分 3 段（400000000 / 400000000 / 399177856 字节）
+  - lm_head_t0.pt                            解码器，622331164 字节
+    用「第 1~10 章 24289 字 + 打字池 2862 条去重」按 25% 混料训练 17001 步（lr 1e-5）得到：
+    小说内部命中 77.9%、留出（第 11 章起）73.8%、top1 42.5%、打字域 10.5%
+
+install.ps1 的 $ReleaseTag 已同步改为 cli_emojiless_RL_v2.0：
+    .\install.ps1 -DownloadModels      # 主干 + 解码器一起拉
+    .\install.ps1 -ModelsOnly          # 只拉模型
+    .\install.ps1 -ModelsOnly -Mirror https://gh.xxooo.cf/    # 走镜像
+（此前 $ReleaseTag 指向不存在的 cli_emojiless_RL_v1.2，-DownloadModels 会 404，本次一并修掉）

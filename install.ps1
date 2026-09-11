@@ -76,7 +76,7 @@ function Start-Weasel([string]$RimeDir) {
     if (Test-Path $exe) { Start-Process -FilePath $exe -WindowStyle Hidden }
 }
 
-$ReleaseTag  = 'cli_emojiless_RL_v1.2'
+$ReleaseTag  = 'cli_emojiless_RL_v2.0'
 $ReleaseBase = 'https://github.com/fengruizhi619-cmd/weasel_LLM_RL/releases/download/' + $ReleaseTag + '/'
 $ModelParts  = @('Qwen3-0.6B-Base.zip.001', 'Qwen3-0.6B-Base.zip.002', 'Qwen3-0.6B-Base.zip.003')
 $HeadAsset   = 'lm_head_t0.pt'
