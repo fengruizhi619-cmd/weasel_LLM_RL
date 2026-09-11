@@ -18,6 +18,8 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
+import head_lib
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 SEGMENTS = os.path.join(HERE, "diag", "segments.jsonl")
 SEEN = os.path.join(HERE, "diag", "segments.seen")
@@ -120,8 +122,9 @@ class Panel(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("LLM 数据面板 · cli_emojiless_RL")
-        self.geometry("480x470")
-        self.resizable(False, False)
+        self.geometry("820x640")
+        self.minsize(820, 600)
+        self.resizable(True, True)
         self.proc = None
         self.queue = queue.Queue()
         self.trained_lines = 0
@@ -164,14 +167,32 @@ class Panel(tk.Tk):
         ttk.Button(buttons, text="刷新", command=self.refresh).pack(side="left", padx=6)
         ttk.Button(buttons, text="打开数据目录", command=self.open_dir).pack(side="left", padx=6)
 
+        mframe = ttk.LabelFrame(self, text="解码器（lm_head）")
+        mframe.grid(row=6, column=0, columnspan=2, sticky="we", padx=12, pady=(8, 4))
+        self.head_var = tk.StringVar()
+        self.head_box = ttk.Combobox(mframe, textvariable=self.head_var,
+                                     state="readonly", width=46)
+        self.head_box.pack(side="left", padx=8, pady=6)
+        ttk.Button(mframe, text="切换", command=self.switch_head).pack(side="left", padx=3)
+        ttk.Button(mframe, text="当前入库", command=self.snap_head).pack(side="left", padx=3)
+        ttk.Button(mframe, text="刷新", command=self.refresh_heads).pack(side="left", padx=3)
+        self.head_status = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.head_status).grid(
+            row=7, column=0, columnspan=2, padx=12, sticky="w")
+
         ttk.Label(self, textvariable=self.progress_var).grid(
-            row=6, column=0, columnspan=2, padx=12, sticky="w")
+            row=8, column=0, columnspan=2, padx=12, sticky="w")
         self.progress = ttk.Progressbar(self, mode="determinate", length=450)
-        self.progress.grid(row=7, column=0, columnspan=2, padx=12, pady=(0, 6))
+        self.progress.grid(row=9, column=0, columnspan=2, padx=12, pady=(0, 6))
 
         self.log_text = tk.Text(self, height=11, width=60, state="disabled",
                                 background="#f7f7f7", relief="flat")
-        self.log_text.grid(row=8, column=0, columnspan=2, padx=12, pady=(0, 10))
+        self.log_text.grid(row=10, column=0, columnspan=2, sticky="nsew",
+                           padx=12, pady=(0, 10))
+        # 让日志区跟着窗口一起拉伸，不再把内容挤出去
+        self.grid_rowconfigure(10, weight=1)
+        self.grid_columnconfigure(0, weight=0)
+        self.grid_columnconfigure(1, weight=1)
 
         self.refresh()
         self.log("一条数据 = 一次提交断点：你 / 吃饭 / 了 / 吗 = 4 条；回退 = 1 条。")
@@ -191,11 +212,44 @@ class Panel(tk.Tk):
     def open_dir(self):
         os.startfile(os.path.join(HERE, "diag"))
 
+    # ---- 解码器库与切换 ----
+    def refresh_heads(self):
+        heads, active = head_lib.list_heads()
+        self.heads = heads
+        items = ["%-12s | u%-5s | %s" % (h["name"], h.get("updates"),
+                                          (h.get("note") or "")[:18])
+                 for h in heads]
+        self.head_box["values"] = items
+        if items and self.head_var.get() not in items:
+            self.head_var.set(items[0])
+        self.head_status.set(
+            "当前线上：updates=%s  ts=%s" % (active.get("updates"), active.get("ts"))
+            if active else "当前线上：没有 lm_head_t0.pt")
+
+    def switch_head(self):
+        i = self.head_box.current()
+        if i < 0 or i >= len(getattr(self, "heads", [])):
+            return
+        name = self.heads[i]["name"]
+        if not messagebox.askyesno(
+                "LLM 数据面板",
+                "把线上解码器切换为「%s」？\n\n当前那份会自动收进库，随时能换回来。\n"
+                "（在线服务 15 秒内自动采纳，不用重启）" % name):
+            return
+        self.log(head_lib.activate(name))
+        self.refresh_heads()
+
+    def snap_head(self):
+        name, msg = head_lib.snapshot()
+        self.log(msg)
+        self.refresh_heads()
+
     def refresh(self):
         self.mode_var.set(read_mode())
         self.pending_var.set("%d 条" % pending_count())
         self.trained_var.set("%d 批" % trained_batches())
         self.detect_processes()
+        self.refresh_heads()
 
     def detect_processes(self):
         self.status_var.set("检测中…")

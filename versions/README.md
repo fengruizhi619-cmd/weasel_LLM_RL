@@ -19,9 +19,10 @@
 | cli_emojiless_RL_v1.3.zip | 拼音前缀匹配、top-k 免建树训练、checkpoint 同步防覆盖、Tab 防僵尸预测 | v1.3 |
 | cli_emojiless_RL_v1.4.zip | 在线离线统一：逐 token 排名奖励、每次提交都训练、未命中走负样本 | v1.4 |
 | cli_emojiless_RL_v2.0.zip | **第一个可正式训练的版本**：纯交叉熵 + 普通 SGD + lr 1e-5 + 打字/小说 25% 混料；新增 train_mix.py 与三指标验收；清理早期原型与死代码 | v2.0 |
+| cli_emojiless_RL_v2.0.1.zip | 解码器库与面板切换区；修面板裁切 bug；线上切到 mix_base | v2.0.1 |
 
 **当前工作树**
-- 基座：cli_emojiless_RL_v2.0（HEAD）
+- 基座：cli_emojiless_RL_v2.0.1（HEAD）
 - 活动实验：tools\LlamaTreeExp + tools\WeaselExpContextV0（外部钩子/候选树/训练）
 - 定型配置：纯交叉熵 / 普通 SGD / lr 1e-5 / 梯度裁剪关闭 / 打字:小说 = 25:75
 - 下一步：验证超大数据量下的泛化（当前只到 1 万字、17001 步；同域 +3 点，换书换文体无数据）

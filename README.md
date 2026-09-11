@@ -213,6 +213,7 @@ WeaselServer 启动时读取 `%APPDATA%\Rime\ghost_mode.txt`，按模式拉起�
 
 | 版本 | 说明 |
 |---|---|
+| `cli_emojiless_RL_v2.0.1` | 解码器库 + 面板一键切换（`head_lib.py`）；修面板被裁切的 bug |
 | `cli_emojiless_RL_v2.0` | **第一个可正式训练的版本**：纯交叉熵 + 普通 SGD + lr 1e-5 + 打字/小说 25% 混料；新增 `train_mix.py`；清理早期原型与死代码；Release 含主干三段 + 训练好的解码器，`-DownloadModels` 一键拉取 |
 | `cli_emojiless_RL_v1.4` | 在线与离线统一为逐 token 排名奖励（逐层相加，长度成为加分项） |
 | `cli_emojiless_RL_v1.3` | 拼音前缀匹配并全程生效、top-k 免建树训练、权重一致性保护、Tab 只提交有效预测 |
