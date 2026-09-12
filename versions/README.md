@@ -20,9 +20,13 @@
 | cli_emojiless_RL_v1.4.zip | 在线离线统一：逐 token 排名奖励、每次提交都训练、未命中走负样本 | v1.4 |
 | cli_emojiless_RL_v2.0.zip | **第一个可正式训练的版本**：纯交叉熵 + 普通 SGD + lr 1e-5 + 打字/小说 25% 混料；新增 train_mix.py 与三指标验收；清理早期原型与死代码 | v2.0 |
 | cli_emojiless_RL_v2.0.1.zip | 解码器库与面板切换区；修面板裁切 bug；线上切到 mix_base | v2.0.1 |
+| cli_emojiless_RL_v2.0.2.zip | 看门狗改无头启动（修每 5 分钟闪窗）；注册脚本修 Duration 越界 + 加硬断言与 -DryRun；codex→DSH 残留硬路径 | v2.0.2 |
 
 **当前工作树**
-- 基座：cli_emojiless_RL_v2.0.1（HEAD）
+- 基座：cli_emojiless_RL_v2.0.2（HEAD）
 - 活动实验：tools\LlamaTreeExp + tools\WeaselExpContextV0（外部钩子/候选树/训练）
 - 定型配置：纯交叉熵 / 普通 SGD / lr 1e-5 / 梯度裁剪关闭 / 打字:小说 = 25:75
+- 工作区位置：E:\DSH_data\研究\weasel-baseline（原 E:\codex_data\研究，已迁移）
+- 无头看门狗：计划任务动作必须是 `wscript.exe ... watchdog.vbs`，不能是 powershell.exe（会闪窗）。
+  改动后需在管理员会话跑一次 output\register-task.ps1 才生效。
 - 下一步：验证超大数据量下的泛化（当前只到 1 万字、17001 步；同域 +3 点，换书换文体无数据）
