@@ -28,8 +28,8 @@ import unified_pipeline as up
 import unified_watcher as uw
 
 NOVEL = r"C:\Users\Feng\Desktop\共享文件夹\银砂纪年\银砂纪年 第一卷 少女们，学院，龙与迫近的危机.txt"
-BASE = r"E:\codex_data\研究\models\Qwen3-0.6B-Base"
-CHAT = r"E:\codex_data\研究\models\Qwen3-0.6B-Chat"
+BASE = r"E:\DSH_data\研究\models\Qwen3-0.6B-Base"
+CHAT = r"E:\DSH_data\研究\models\Qwen3-0.6B-Chat"
 START, END = 30, 24319
 RATIO, LR, STEPS, SEED = 0.25, 1e-5, 17001, 12345
 HOLDOUT = 200

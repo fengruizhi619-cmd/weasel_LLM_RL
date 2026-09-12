@@ -18,8 +18,8 @@ import probe_eval as pe
 import unified_pipeline as up
 
 NOVEL = r"C:\Users\Feng\Desktop\共享文件夹\银砂纪年\银砂纪年 第一卷 少女们，学院，龙与迫近的危机.txt"
-MODELS = [("Base", r"E:\codex_data\研究\models\Qwen3-0.6B-Base"),
-          ("Chat", r"E:\codex_data\研究\models\Qwen3-0.6B-Chat")]
+MODELS = [("Base", r"E:\DSH_data\研究\models\Qwen3-0.6B-Base"),
+          ("Chat", r"E:\DSH_data\研究\models\Qwen3-0.6B-Chat")]
 
 
 def main():
