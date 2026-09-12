@@ -1,4 +1,4 @@
-﻿# watchdog.ps1 - keep the online chain alive
+# watchdog.ps1 - keep the online chain alive
 $ErrorActionPreference = 'Continue'
 $base = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $exp = Join-Path $base 'tools\LlamaTreeExp'
