@@ -46,21 +46,22 @@ $triggers = @(
   (New-ScheduledTaskTrigger -AtLogOn)
 )
 
-# 预检：把将要注册的内容打印出来，确认 Duration/Interval 合法（-DryRun 只做这一步）
-$check = New-ScheduledTask -Action $action -Trigger $triggers -Principal $principal -Settings $settings
-$checkXml = Export-ScheduledTask -TaskName 'WeaselOnlineWatchdog-DryRunCheck' -ErrorAction SilentlyContinue
-if (-not $checkXml) {
-  # Export-ScheduledTask 只认已注册任务，这里退化为直接展示关键字段
-  $t0 = $triggers[0]
-  $dur = $t0.Repetition.Duration
-  $ivl = $t0.Repetition.Interval
-} else {
-  $dur = ([regex]::Match($checkXml, '<Duration>([^<]*)</Duration>')).Groups[1].Value
-  $ivl = ([regex]::Match($checkXml, '<Interval>([^<]*)</Interval>')).Groups[1].Value
+# 硬断言：动作参数必须真的带上 vbs 路径。
+# New-ScheduledTaskAction 在参数丢失/类型不对时不会报错，只会返回空 Arguments —— 那样注册出来的
+# 任务等于跑一个没有参数的 wscript.exe，看门狗彻底失效，而且不报任何错。这里宁可当场失败。
+if (-not $action.Arguments -or $action.Arguments -notlike '*watchdog.vbs*') {
+  Note ("FAIL 动作参数异常，Arguments=[" + $action.Arguments + "]")
+  throw ("动作参数异常：wscript 没拿到 watchdog.vbs 路径（Arguments=[" + $action.Arguments + "]），拒绝注册")
 }
-Write-Host ("动作      : {0} {1}" -f $action.Execute, $action.Argument)
+
+# 预检：把将要注册的内容打印出来，确认 Duration/Interval 合法（-DryRun 只做这一步）
+$t0 = $triggers[0]
+$dur = $t0.Repetition.Duration
+$ivl = $t0.Repetition.Interval
+
+Write-Host ("动作      : {0} {1}" -f $action.Execute, $action.Arguments)
 Write-Host ("重复      : Interval={0}  Duration={1}" -f $ivl, $dur)
-Note ("check: action={0} {1} interval={2} duration={3}" -f $action.Execute, $action.Argument, $ivl, $dur)
+Note ("check: action={0} {1} interval={2} duration={3}" -f $action.Execute, $action.Arguments, $ivl, $dur)
 
 if ($DryRun) {
   Write-Host ''
