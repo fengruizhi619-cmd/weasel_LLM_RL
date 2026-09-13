@@ -1,0 +1,13 @@
+# 真实打字语料的解密文本 + 小说正文：绝不入库
+# （原始语料在 diag/ 里是 AES-256-GCM 加密的，这里的是解密导出物）
+src/
+
+# 评测结果里含真实输入内容（上文/目标都是用户实际打过的字）
+next_sentence_result.json
+
+# 上传/训练产物
+distill_v1_*.zip
+runs/
+logs/
+__pycache__/
+*.pyc
