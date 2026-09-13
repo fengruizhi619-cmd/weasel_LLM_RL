@@ -67,3 +67,6 @@ models/
 llama.cpp/
 ghost_home.txt
 build_rime/
+
+# 内部资料：项目交接手册（生成物，含本机路径，不进版本库）
+/weasel_LLM_RL.md
