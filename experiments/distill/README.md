@@ -630,6 +630,28 @@ n-gram 作为 top-1 精确层与它互补。联想句另走大模型（后置模
 信号量赢了聚焦。**数据量是墙（呼应 D0479：长文本生成需万~十万条样本），分割方式
 是第二阶。** 若数据量 10 倍以上，聚焦式训练可能翻盘 —— 当前数据下不可证伪也不可证实。
 
+### 外部对照：GPT2-Chinese 117M 与 sloth 输入法（2026-09-14 调研）
+
+**GPT2-Chinese 117M（uer/gpt2-chinese-cluecorpussmall）能力实测（probe_gpt2.py）**：
+- 知识问答 **0/13 命中**：回显 prompt（"中国的首都是 → 是中国的首"）、垃圾 token
+  （"鲁迅的原名是 → ##ids"）、空输出（直接吐停止符）。2019 年 CLUECorpusSmall
+  训练的老模型，既无事实知识也不生成 —— **比我们的 0.13M 字符模型还差，不值得走**。
+- 技术备注：该模型 tokenizer 是 BertTokenizer（21,128 词级，非 BPE）；torch<2.6 加载
+  .bin 被 CVE-2025-32434 安全门拦，需 `torch.load(weights_only=True)` 转 safetensors
+  （共享张量要 `.clone()` 断开再存）。
+
+**sloth 输入法（vieenrose/sloth-zhuyin-linux，LLM 驱动端侧 IME）实现要点**：
+- 两模型分工：**12M 三值（W1.58A8）双向编码器**做注音→整句免选字（N 音节→N 字，
+  每位置限定同音字集，非自回归一次前向，BOOX 实测 9.3ms/键）；**60M Q4 自回归解码器**
+  做上字后次词预测（Gated DeltaNet 线性注意力 O(1)/步，8.5ms/词）。
+- 数据：**610 万句** c4-chinese-zhtw + PTT/Dcard 微调；解码器一般语料 next-word
+  top-1 33.5 / top-5 45.2。→ **再次印证数据量是墙**（我们 9.6k 片段）。
+- 部署：llama.cpp GGUF（TQ2_0 三值 / Q4_K_M），四前端共用 libslothe；基准沾染
+  （两次 eval 集泄漏）教训与 KD-on-ternary 不出货都值得读 docs/ARCH-REVIEW.md。
+- 与我们的路线同构：约束解码转写（我们用 n-gram/Trie，因拼音+用户词库更省）+ 自回归
+  联想（可照抄其 60M 解码器配方）。Gated DeltaNet 已进 llama.cpp 官方 qwen35 路径，
+  是"现代架构"的现成选项。
+
 ## 云端同步
 只带运行必需的东西（**不要带 `diag/`、密钥、模型权重**）：
 
