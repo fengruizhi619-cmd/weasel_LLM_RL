@@ -86,11 +86,18 @@ class LoopedStudent(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)             # (B, L, head_dim)
         return emb.cos().to(hidden_states.dtype), emb.sin().to(hidden_states.dtype)
 
-    def forward(self, input_ids, attention_mask=None, collect_rounds=False):
-        """返回 (final_logits, round_logits 或 None)。
+    def forward(self, input_ids, attention_mask=None, collect_rounds=False,
+                collect_hidden=False, grad_rounds=None):
+        """返回 (final_logits, aux)。
 
-        final_logits : (B, L, V)
-        round_logits : list[T] of (B, L, V)，每轮循环的早退输出（collect_rounds=True 时）
+        aux = None，或 {"round_logits": [...], "round_hidden": [...]}
+
+        collect_rounds : 收每轮的早退 logits（**无梯度**，评测用；算全轮很贵）
+        collect_hidden : 收每轮循环边界的 hidden（**带梯度**，插入式蒸馏用；很便宜）
+        grad_rounds    : 只对这些轮号（1 基）额外算**带梯度**的 logits，返回在
+                         aux["round_logits_grad"] 里。为什么要限定：每轮 logits 是
+                         (B,L,V)=B·L·151936，u1t28 全轮带梯度会吃掉好几 GB；
+                         而插入式蒸馏只需要末尾若干轮的输出监督。
         """
         B, L = input_ids.shape
         dev = input_ids.device
@@ -115,6 +122,9 @@ class LoopedStudent(nn.Module):
             mask = causal[None, None] + pad
 
         round_logits = []
+        round_hidden = []
+        round_logits_grad = {}
+        want_grad = set(grad_rounds or ())
         for t in range(self.loops):
             h = h + self.round_emb(torch.full((B,), t, dtype=torch.long, device=dev))[:, None, :]
             for li in range(self.uniq):
@@ -124,16 +134,27 @@ class LoopedStudent(nn.Module):
                 # 于是单层配置看起来正常、多层配置在第二层炸 —— 别加 [0]。
                 h = self.layers[li](h, attention_mask=mask, position_ids=position_ids,
                                     position_embeddings=(cos, sin))
+            # 循环边界：这里是插入式蒸馏的监督点。h 是**未归一化**的，
+            # 与教师 hidden_states[0..L-1] 同一约定，可以直接对齐。
+            if collect_hidden:
+                round_hidden.append(h)
             if collect_rounds:
                 with torch.no_grad():
                     round_logits.append(self.lm_head(self.norm(h)).float())
+            if (t + 1) in want_grad:
+                # 带梯度的早退读出：插入式蒸馏在末几轮做输出级监督。
+                round_logits_grad[t + 1] = self.lm_head(self.norm(h))
         # final norm 只施加一次！Qwen3Model.forward 的最后一句就是
         # `hidden_states = self.norm(hidden_states)`，输出已是归一化后的，
         # 而 Qwen3ForCausalLM 直接 lm_head(hidden_states) 不再归一化。
         # 这里若写 self.lm_head(self.norm(h)) 就是**重复归一化**：
         # RMSNorm 不幂等，表现是输出分布看着正常（std 接近）但逐位 argmax 只对 ~0.28。
         logits = self.lm_head(self.norm(h))
-        return logits, (round_logits if collect_rounds else None)
+        aux = None
+        if collect_rounds or collect_hidden or round_logits_grad:
+            aux = {"round_logits": round_logits, "round_hidden": round_hidden,
+                   "round_logits_grad": round_logits_grad}
+        return logits, aux
 
     # ---- 工具 ----
     def param_report(self):

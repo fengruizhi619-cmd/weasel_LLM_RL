@@ -62,6 +62,9 @@ ARMS = {           # 臂名 -> (uniq 层数, loops 轮数)；等效深度 = uniq
     "u1t28": (1, 28),       # 等效深度 28，参数约 16M
     "u1t8": (1, 8),         # 等效深度 8（甜点臂）
     "u1t4": (1, 4),
+    # —— 插入式蒸馏：监督点落在"每 U 层一个循环边界"上 ——
+    "u2t14": (2, 14),       # 每 2 层一个监督点，等效深度 28（教师深度）
+    "u2t5": (2, 5),         # 每 2 层一个监督点，等效深度 10（便宜迭代臂）
 }
 
 
@@ -194,27 +197,201 @@ def make_windows(tokenizer, text, seq_len, device, limit=0):
     return x, y
 
 
+# ---------------------------------------------------------------- 插入式蒸馏
+
+def boundary_depths(arm_uniq, arm_loops, teacher_layers, mapping="head"):
+    """学生第 t 轮（1 基）的循环边界该对齐教师第几层。返回 list[loops]。
+
+    mapping="head"：d_t = t · U（从头对齐）—— "学生每 U 层对应教师前 U 层"。
+    mapping="tail"：d_t = L - (T - t) · U（从尾对齐）—— 把"轮数不足铺满深度"的臂
+        （u1t8: T=8 < 28）锚在教师的**精修段**上，而不是锚在教师的特征构建段上。
+
+    **为什么要留 tail 这个选项（这是测出来的，不是猜的）**：教师逐层 logit-lens
+    top1 曲线极不均匀（见 probe_depth.py 实测）——
+        小说留出：深度 1~17 → 0.001~0.036；20 → 0.123；24 → 0.248；27 → 0.363；28 → 0.401
+        打字留出：深度 1~9  → 0.000~0.013；20 → 0.178；22 → 0.470；26 → 0.795；28 → 0.82
+    即**前 20 层几乎不含预测内容，是纯建特征；只有最后 8 层在做预测**。
+    所以"学生第 t 轮 = 教师第 t·U 层"对浅臂是个可疑假设：u1t8 的 8 个边界会全落在
+    教师的特征构建段（目标读出精度 0.002~0.009）。tail 映射把同样的 8 轮锚到 21~28 层。
+    """
+    L = int(teacher_layers)
+    out = []
+    for t in range(1, arm_loops + 1):
+        d = (t * arm_uniq) if mapping == "head" else (L - (arm_loops - t) * arm_uniq)
+        out.append(max(1, min(L, d)))
+    return out
+
+
+def make_insertion_plan(arm_uniq, arm_loops, teacher_layers, args, depth_acc=None):
+    """算出插入式蒸馏的监督计划。
+
+    返回 dict：depths=list[T]（每轮的教师对齐层）、hint=list[T]（0/1 权重）、
+              logit=list[T]（0/1 是否插输出级监督）
+    """
+    depths = boundary_depths(arm_uniq, arm_loops, teacher_layers, args.ins_map)
+    hint = [args.ins_hint_w] * arm_loops if args.ins_hint_w > 0 else [0.0] * arm_loops
+    logit = [0.0] * arm_loops
+    if args.ins_logit_w > 0:
+        # 只在不低于阈值的深度插**输出级**监督：早层的 lens 读出是垃圾目标，
+        # 全权重匹配它 = 教学生"早期输出要烂"。
+        tau = args.ins_logit_tau
+        for t, d in enumerate(depths):
+            ok = True if tau <= 0 else (depth_acc is None or depth_acc[d] >= tau)
+            if ok:
+                logit[t] = args.ins_logit_w
+        # 显存约束：带梯度的逐轮 logits 只留最后 K 轮
+        keep = max(0, args.ins_logit_rounds)
+        if keep and sum(1 for v in logit if v > 0) > keep:
+            live = [t for t in range(arm_loops) if logit[t] > 0][-keep:]
+            logit = [logit[t] if t in live else 0.0 for t in range(arm_loops)]
+        logit[-1] = 0.0        # 末轮走既有的"真实最终输出"损失，不重复计
+    return {"depths": depths, "hint": hint, "logit": logit}
+
+
+def teacher_depth_targets(teacher, xb, depths, need_logit, temp):
+    """教师各对齐深度的目标。
+
+    norm 施加规则（踩过，见 probe_depth.py 自检）：transformers 的 hidden_states
+    `[0..L-1]` 是各层**未归一化**输出，`[L]` 已经过 final norm；给 `[L]` 再补一次
+    norm 就是重复归一化（实测 0.401 → 0.284）。学生的 h 在循环边界也**未归一化**，
+    两者同一约定，可以直接对齐。
+    """
+    with torch.no_grad():
+        out = teacher(xb, output_hidden_states=True)
+        hs = out.hidden_states
+        L = teacher.config.num_hidden_layers
+        t_top1 = out.logits.argmax(-1)
+        t_final_prob = F.softmax(out.logits.float() / temp, dim=-1)
+
+        def _read(d):
+            return hs[L] if d >= L else teacher.model.norm(hs[d])
+
+        # 逐深度的输出级目标：只在需要时算，算完立刻留 prob（丢 logits）省显存 ——
+        # 每层 prob 是 (B,L,151936) 的 fp32，u1t28 全算会吃掉好几 GB。
+        t_prob = {d: F.softmax(teacher.lm_head(_read(d)).float() / temp, dim=-1)
+                  for d in need_logit}
+        # 逐深度的表示级目标：未归一化的那一份（与学生循环边界的 h 同约定）
+        hints = {d: (hs[L] if d >= L else hs[d]).detach().clone() for d in set(depths)}
+        del out, hs
+    return {"hints": hints, "t_prob": t_prob, "t_top1": t_top1, "t_final_prob": t_final_prob}
+
+
+def insertion_terms(student_h, plan, targets, grad_logits, temp, hint_kind="cos"):
+    """算出插入式蒸馏的各附加损失项。全部返回 (标量 tensor 或 None, 统计 dict)。
+
+    **按监督点个数取均值**，不是求和：否则 u1t28（28 个边界）的总 hint 权重会是
+    u2t5（5 个边界）的 5.6 倍，`--ins-hint-w` 在不同臂上就不是同一个超参，
+    跨臂比较直接作废（踩过）。
+    """
+    st = {}
+    hint_loss, n_hint = None, 0
+    for t, (w, d) in enumerate(zip(plan["hint"], plan["depths"])):
+        if w <= 0 or t >= len(student_h):
+            continue
+        a = student_h[t].float()
+        b = targets["hints"][d].float()
+        if hint_kind == "mse":
+            per = F.mse_loss(a, b, reduction="none").mean(-1)
+            st["ins_hint_t%d" % (t + 1)] = float(per.mean())
+        else:
+            # 余弦：尺度无关，对学生早期"量级没长对"更宽容 —— 早期轮次用 MSE
+            # 会被量级差异主导，把梯度全花在缩放上。
+            per = 1.0 - F.cosine_similarity(a, b, dim=-1)
+            st["ins_hint_t%d" % (t + 1)] = float(per.mean())
+        term = per.mean() * w
+        hint_loss = term if hint_loss is None else hint_loss + term
+        n_hint += 1
+    if hint_loss is not None and n_hint:
+        hint_loss = hint_loss / n_hint
+    logit_loss, n_logit = None, 0
+    for t, (w, d) in enumerate(zip(plan["logit"], plan["depths"])):
+        if w <= 0 or (t + 1) not in grad_logits:
+            continue
+        s_log = F.log_softmax(grad_logits[t + 1].float() / temp, dim=-1)
+        tp = targets["t_prob"][d]
+        kl = F.kl_div(s_log, tp, reduction="none").sum(-1)
+        term = (kl * (temp ** 2)).mean() * w
+        logit_loss = term if logit_loss is None else logit_loss + term
+        n_logit += 1
+        with torch.no_grad():
+            st["ins_logit_agree_t%d" % (t + 1)] = float(
+                (grad_logits[t + 1].argmax(-1) == tp.argmax(-1)).float().mean())
+        del s_log, kl
+    if logit_loss is not None and n_logit:
+        logit_loss = logit_loss / n_logit
+    return hint_loss, logit_loss, st
+
+
 # ---------------------------------------------------------------- 训练
 
-def distillation_step(student, teacher, xb, yb, temp, alpha_ce, device):
-    """返回 (loss, 统计)。教师概率算完即释放 logits，只留 probs（省显存）。"""
-    with torch.no_grad():
-        t_logits = teacher(xb).logits
-        t_prob = F.softmax(t_logits.float() / temp, dim=-1)
-        t_top1 = t_logits.argmax(-1)
-        del t_logits
-    s_logits = student(xb)[0]
+def distillation_step(student, teacher, xb, yb, temp, alpha_ce, device,
+                      ins_plan=None, hint_kind="cos", want_stats=True):
+    """返回 (loss, 统计)。教师概率算完即释放 logits，只留 probs（省显存）。
+
+    ins_plan 不为 None 时启用**插入式蒸馏**：在每轮循环边界插表示(hint)监督、
+    在末几轮插输出(logit)监督。分子项权重见 make_insertion_plan。
+    """
+    grad_rounds = None
+    if ins_plan is not None:
+        grad_rounds = [t + 1 for t, w in enumerate(ins_plan["logit"]) if w > 0]
+    need_logit = sorted({ins_plan["depths"][t] for t, w in enumerate(ins_plan["logit"])
+                         if w > 0}) if ins_plan is not None else []
+
+    if ins_plan is not None:
+        tg = teacher_depth_targets(teacher, xb, ins_plan["depths"], need_logit, temp)
+        t_prob, t_top1, t_final_prob = tg["t_prob"], tg["t_top1"], tg["t_final_prob"]
+    else:
+        tg = None
+        with torch.no_grad():
+            t_logits = teacher(xb).logits
+            t_prob = F.softmax(t_logits.float() / temp, dim=-1)
+            t_top1 = t_logits.argmax(-1)
+            del t_logits
+
+    if ins_plan is not None:
+        s_logits, aux = student(xb, collect_hidden=True, grad_rounds=grad_rounds)
+        aux = aux or {}
+    else:
+        s_logits, aux = student(xb)
+
     s_log = F.log_softmax(s_logits.float() / temp, dim=-1)
-    kl = F.kl_div(s_log, t_prob, reduction="none").sum(-1)
-    del t_prob
+    kl = F.kl_div(s_log, t_final_prob if ins_plan is not None else t_prob,
+                  reduction="none").sum(-1)
     loss = (kl * (temp ** 2)).mean()
     ce = F.cross_entropy(s_logits.float().view(-1, s_logits.size(-1)), yb.view(-1))
     loss = loss + alpha_ce * ce
+
+    st = {}
+    if ins_plan is not None:
+        h_loss, l_loss, ist = insertion_terms(aux.get("round_hidden") or [],
+                                              ins_plan, tg,
+                                              aux.get("round_logits_grad") or {}, temp, hint_kind)
+        st.update(ist)
+        if h_loss is not None:
+            loss = loss + h_loss
+        if l_loss is not None:
+            loss = loss + l_loss
+        del t_prob
+        # 循环边界的表示对齐度（余弦均值）—— 看监督有没有真的把表示推过去
+        with torch.no_grad():
+            hh = aux.get("round_hidden") or []
+            if hh:
+                cs = []
+                for t, d in enumerate(ins_plan["depths"]):
+                    a, b = hh[t].float(), tg["hints"][d].float()
+                    cs.append(float(F.cosine_similarity(a, b, dim=-1).mean()))
+                st["ins_hint_cos_mean"] = sum(cs) / len(cs)
+                st["ins_hint_cos_first"] = cs[0]
+                st["ins_hint_cos_last"] = cs[-1]
+    else:
+        del t_prob
+
     with torch.no_grad():
         agree = (s_logits.argmax(-1) == t_top1).float().mean()
         acc = (s_logits.argmax(-1) == yb).float().mean()
         kl_scalar = (kl / xb.numel()).mean() if xb.numel() else kl.mean()
-    return loss, {"kl": float(kl_scalar), "agree_top1": float(agree), "student_acc": float(acc)}
+    st.update({"kl": float(kl_scalar), "agree_top1": float(agree), "student_acc": float(acc)})
+    return loss, st
 
 
 @torch.no_grad()
@@ -246,7 +423,8 @@ def evaluate(student, teacher, x, y, temp, device, max_batches=8, collect_rounds
         t_prob = F.softmax(t_logits.float() / temp, dim=-1)
         t_top1 = t_logits.argmax(-1)
         del t_logits
-        s_logits, rounds = student(xb, collect_rounds=collect_rounds)
+        s_logits, aux = student(xb, collect_rounds=collect_rounds)
+        rounds = (aux or {}).get("round_logits")
         s_log = F.log_softmax(s_logits.float() / temp, dim=-1)
         agg["kl"] += float(F.kl_div(s_log, t_prob, reduction="batchmean"))
         agg["agree_top1"] += float((s_logits.argmax(-1) == t_top1).float().mean())
@@ -303,6 +481,19 @@ def main():
     ap.add_argument("--lr-backbone", type=float, default=0.0,
                     help="主干学习率；0 表示用 --lr/10")
     ap.add_argument("--resume", default="", help="从已有 student.pt 继续训（两步法：先上课再冻结训头）")
+    # —— 插入式蒸馏（在每轮循环边界插监督信号）——
+    ap.add_argument("--ins-hint-w", type=float, default=0.0,
+                    help="循环边界表示(hint)监督的权重；0=关。这是插入式蒸馏的主项")
+    ap.add_argument("--ins-hint-kind", default="cos", choices=["cos", "mse"],
+                    help="表示对齐用余弦（尺度无关，早期轮次推荐）还是 MSE")
+    ap.add_argument("--ins-logit-w", type=float, default=0.0,
+                    help="循环边界输出(logit)监督的权重；0=关。早层 lens 读出是垃圾目标，慎用")
+    ap.add_argument("--ins-logit-tau", type=float, default=0.10,
+                    help="只对教师同深度 lens 精度 >= tau 的边界插输出级监督（0=全插）")
+    ap.add_argument("--ins-logit-rounds", type=int, default=4,
+                    help="带梯度的逐轮 logits 最多留最后 K 轮（显存约束）")
+    ap.add_argument("--ins-map", default="head", choices=["head", "tail"],
+                    help="深度对齐映射：head=t·U（从头）；tail=L-(T-t)·U（从尾，锚在教师精修段）")
     ap.add_argument("--smoke", action="store_true", help="只抽 200 条 / 跑 20 步 / 跳过留出评估")
     ap.add_argument("--teacher-baseline", action="store_true", default=True,
                     help="打印/记录教师自身在留出集上的 top1（蒸馏上限参照）")
@@ -352,6 +543,34 @@ def main():
         % (f"{t_total:,}", f"{t_params:,}"))
     log("学生唯一参数 %s  学生/教师(state_dict) = %.3f"
         % (f"{rep['total_unique']:,}", rep["total_unique"] / t_total))
+
+    # ---- 插入式蒸馏计划：把监督点铺到循环边界上 ----
+    ins_plan = None
+    if args.ins_hint_w > 0 or args.ins_logit_w > 0:
+        depth_acc = None
+        if args.ins_logit_w > 0 and args.ins_logit_tau > 0:
+            p = os.path.join(HERE, "probe_depth_result.json")
+            if os.path.exists(p):
+                try:
+                    dj = json.load(open(p, encoding="utf-8"))["per_layer_acc"]
+                    key = "typing" if dj.get("typing") else "novel"
+                    depth_acc = dj[key]
+                    log("载入逐层 lens 曲线（%s，%d 层）用于 tau=%.2f 过滤"
+                        % (key, len(depth_acc) - 1, args.ins_logit_tau))
+                except Exception as e:
+                    log("逐层曲线载入失败（%s）→ tau 过滤退化为全插" % e)
+        ins_plan = make_insertion_plan(uniq, loops, teacher.config.num_hidden_layers,
+                                       args, depth_acc)
+        log("插入式蒸馏：map=%s 边界深度=%s" % (args.ins_map, ins_plan["depths"]))
+        log("  hint 权重 %s ｜ logit 权重 %s（tau=%.2f，最多带梯度 %d 轮）"
+            % (ins_plan["hint"], ins_plan["logit"], args.ins_logit_tau, args.ins_logit_rounds))
+        if not any(ins_plan["hint"]) and not any(ins_plan["logit"]):
+            raise SystemExit("插入式蒸馏开了但所有监督点权重为 0，检查 --ins-* 参数")
+        if args.ins_logit_w > 0 and not any(ins_plan["logit"]):
+            # 静默无监督是最糟的失败模式：命令看着成功、其实没插任何输出级监督。
+            log("警告：--ins-logit-w=%.2f 但 tau=%.2f 把全部边界都过滤掉了"
+                "（这些深度的教师读出精度都不够），等效于没插 logit 监督"
+                % (args.ins_logit_w, args.ins_logit_tau))
 
     if args.init == "pretrained":
         used, missing = student.init_from_teacher(teacher.state_dict())
@@ -444,6 +663,8 @@ def main():
     meta = vars(args).copy()
     meta.update({"uniq": uniq, "loops": loops, "effective_depth": student.effective_depth,
                  "student_params": rep, "teacher_params": t_total,
+                 "ins_plan": ins_plan,          # 插入式蒸馏的完整计划（含每个边界对齐的教师深度）
+                 "train_scope": args.train_scope,
                  "train_windows": int(x.size(0)), "holdout_windows": int(xv.size(0)),
                  "teacher_acc_novel": t_novel, "teacher_acc_typing": t_typing})
     with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
@@ -466,7 +687,8 @@ def main():
             yb = y[ptr:ptr + args.micro]
             ptr += args.micro
             loss, st = distillation_step(student, teacher, xb, yb, args.temp,
-                                         args.alpha_ce, device)
+                                         args.alpha_ce, device,
+                                         ins_plan=ins_plan, hint_kind=args.ins_hint_kind)
             (loss / micro_per_step).backward()
             for k, v in st.items():
                 acc_stats[k] = acc_stats.get(k, 0.0) + v / micro_per_step
@@ -476,9 +698,15 @@ def main():
         sched.step()
 
         if step % 20 == 0 or step == 1:
-            log("step %d/%d loss=%.4f kl=%.4f agree=%.4f acc=%.4f lr=%.2e %.1fs"
+            extra = ""
+            if ins_plan is not None and "ins_hint_cos_mean" in acc_stats:
+                extra = (" ins_cos(首/末/均)=%.3f/%.3f/%.3f"
+                         % (acc_stats.get("ins_hint_cos_first", 0.0),
+                            acc_stats.get("ins_hint_cos_last", 0.0),
+                            acc_stats.get("ins_hint_cos_mean", 0.0)))
+            log("step %d/%d loss=%.4f kl=%.4f agree=%.4f acc=%.4f lr=%.2e %.1fs%s"
                 % (step, args.steps, float(loss.detach()), acc_stats["kl"], acc_stats["agree_top1"],
-                   acc_stats["student_acc"], sched.get_last_lr()[0], time.time() - t0))
+                   acc_stats["student_acc"], sched.get_last_lr()[0], time.time() - t0, extra))
 
         if step % args.eval_every == 0 or step == args.steps:
             ev = evaluate(student, teacher, xv, yv, args.temp, device,
@@ -492,11 +720,19 @@ def main():
                 log("  早退曲线（第1..%d轮 与教师top1一致率）：%s"
                     % (len(ra), " ".join("%.3f" % v for v in ra[:8])))
             if xt is not None:
-                et = evaluate(student, teacher, xt, yt, args.temp, device, max_batches=4)
+                # 打字域也收早退曲线：插入式蒸馏的**产品收益**就在这条线上 ——
+                # 第 t 轮就能用，意味着在线推理只需跑 t 轮（省算力）。
+                et = evaluate(student, teacher, xt, yt, args.temp, device, max_batches=4,
+                              collect_rounds=(step == args.steps))
                 rec["typing_kl"] = et["kl"]
                 rec["typing_agree_top1"] = et["agree_top1"]
                 rec["typing_student_acc"] = et["student_acc"]
                 rec["teacher_acc_typing"] = t_typing
+                if "round_agree" in et:
+                    rec["typing_round_agree"] = et["round_agree"]
+                    log("  打字早退曲线（第1..%d轮）：%s"
+                        % (len(et["round_agree"]),
+                           " ".join("%.3f" % v for v in et["round_agree"][:8])))
             with open(metrics_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             log("  [eval·小说] step=%d kl=%.4f agree_top1=%.4f student_acc=%.4f%s"
