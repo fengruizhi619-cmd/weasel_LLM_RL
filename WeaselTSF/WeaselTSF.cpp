@@ -1,10 +1,11 @@
-﻿#include "stdafx.h"
+#include "stdafx.h"
 
 #include <WeaselIPCData.h>
 #include <thread>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include "WeaselTSF.h"
+#include "EditSession.h"
 #include "CandidateList.h"
 #include "LanguageBar.h"
 #include "Compartment.h"
@@ -290,6 +291,28 @@ bool WeaselTSF::_EnsureServerConnected() {
 }
 
 // [GHOST-TSF-011 SNAPSHOT-COLLECTOR] in-process engine variant
+// [GHOST-FIX-012] 光标框判据与 HRESULT 文本化。
+// 判据必须是"矩形退化"而不是 "left==0 && top==0"：要么右<=左且下<=上（全零/退化），
+// 要么整个矩形落在虚拟屏幕之外，才算不可用。屏幕原点附近的合法位置不能被误杀。
+namespace {
+inline BOOL GhostRectUsable(const RECT& r) {
+  if (r.right <= r.left && r.bottom <= r.top)
+    return FALSE;
+  const int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+  const int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+  RECT virt{vx, vy, vx + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            vy + GetSystemMetrics(SM_CYVIRTUALSCREEN)};
+  RECT out{};
+  return IntersectRect(&out, &r, &virt);
+}
+
+inline std::wstring GhostHrText(HRESULT hr) {
+  wchar_t buf[16]{};
+  swprintf_s(buf, L"0x%08X", static_cast<unsigned>(hr));
+  return buf;
+}
+}  // namespace
+
 bool WeaselTSF::_ReadGhostPrefix(ITfContext* pContext,
                                 TfEditCookie ecReadOnly,
                                 std::wstring* prefix, LONG* caret,
@@ -339,22 +362,63 @@ bool WeaselTSF::_ReadGhostPrefix(ITfContext* pContext,
   }
 
   RECT rect{};
+  // [GHOST-FIX-012] 光标框获取重写。原来的写法有三个坑，正是 Chrome / Electron
+  // （DSH Desktop）联想失效的根因：
+  //   1) `GetTextExt` 的返回值被**丢弃**了 —— 失败与"成功但矩形全零"分不开，
+  //      出错时连一条日志都没有；
+  //   2) 有效性判据写成 `left == 0 && top == 0`：既会误杀屏幕原点附近的合法位置，
+  //      又分不清"退化矩形"，而且 Chromium 给不出时返回的正是全零矩形；
+  //   3) 唯一的兜底 `GetCaretPos` 需要 **Win32 原生光标**（CreateCaret/ShowCaret）。
+  //      Chromium 自己画光标、从不创建原生光标，所以这条在 Chrome / Electron 里
+  //      必然失败；记事本是经典 Win32 控件，有原生光标，于是只有它能用。
+  HRESULT view_hr = E_FAIL;
+  HRESULT ext_hr = E_FAIL;
+  BOOL clipped = FALSE;
+  BOOL rect_ok = FALSE;
   com_ptr<ITfContextView> context_view;
-  if (SUCCEEDED(pContext->GetActiveView(&context_view)) &&
-      context_view != nullptr) {
-    BOOL clipped = FALSE;
-    context_view->GetTextExt(ecReadOnly, selection.range, &rect, &clipped);
-  }
-  if (rect.left == 0 && rect.top == 0) {
-    POINT caret_point{};
-    HWND foreground = GetForegroundWindow();
-    if (foreground && GetCaretPos(&caret_point) &&
-        ClientToScreen(foreground, &caret_point)) {
-      rect = {caret_point.x, caret_point.y, caret_point.x + 2,
-              caret_point.y + 20};
+  view_hr = pContext->GetActiveView(&context_view);
+  if (SUCCEEDED(view_hr) && context_view != nullptr) {
+    ext_hr = context_view->GetTextExt(ecReadOnly, selection.range, &rect, &clipped);
+    rect_ok = GhostRectUsable(rect);
+    if (!rect_ok) {
+      // 空区间取不到框时，退一步用单字符区间：不少文本存储（Chromium 尤其明显）
+      // 对空区间返回全零或 TS_E_NOLAYOUT，而对单字符区间能给真实位置。
+      LONG from = caret_pos > 0 ? caret_pos - 1 : caret_pos;
+      if (acp_range->SetExtent(from, 1) == S_OK) {
+        RECT r2{};
+        BOOL c2 = FALSE;
+        HRESULT hr2 = context_view->GetTextExt(ecReadOnly, acp_range, &r2, &c2);
+        if (GhostRectUsable(r2)) {
+          rect = r2;
+          clipped = c2;
+          ext_hr = hr2;
+          rect_ok = TRUE;
+        }
+      }
+      acp_range->SetExtent(caret_pos, 0);  // 还原成空区间
     }
   }
-  if (rect.left == 0 && rect.top == 0) {
+  if (!rect_ok) {
+    // 原生光标兜底：GetGUIThreadInfo 比 GetCaretPos 更通用（后者只对调用线程自己的
+    // 光标有效）。对 Chromium 无效，但对经典控件是有效的补充。
+    GUITHREADINFO gti{};
+    gti.cbSize = sizeof(gti);
+    if (GetGUIThreadInfo(0, &gti) && gti.hwndCaret) {
+      POINT pt{gti.rcCaret.left, gti.rcCaret.bottom};
+      if (ClientToScreen(gti.hwndCaret, &pt)) {
+        rect = {pt.x, pt.y, pt.x + 2, pt.y + 20};
+        rect_ok = GhostRectUsable(rect);
+      }
+    }
+  }
+  // 这一段常开日志（LlmLog 带 pid/tid），Chromium 类应用出问题时能直接定位，
+  // 不必再去开 WEASEL_GHOST_TRACE。
+  LlmLog(L"ghost caret rect view_hr=" + GhostHrText(view_hr) + L" ext_hr=" +
+         GhostHrText(ext_hr) + L" clipped=" + std::to_wstring(clipped ? 1 : 0) +
+         L" rect=" + std::to_wstring(rect.left) + L"," + std::to_wstring(rect.top) +
+         L"," + std::to_wstring(rect.right) + L"," + std::to_wstring(rect.bottom) +
+         L" ok=" + std::to_wstring(rect_ok ? 1 : 0));
+  if (!rect_ok) {
     weasel::ghost::TraceLine(L"snapshot hidden: caret rect unavailable");
     return false;
   }
@@ -386,6 +450,9 @@ void WeaselTSF::_UpdateGhostSnapshot(ITfContext* pContext,
   RECT caret_rect{};
   if (!_ReadGhostPrefix(pContext, ecReadOnly, &prefix, &caret, &caret_rect)) {
     _HideGhostPrediction();
+    // [GHOST-FIX-012] 在编辑回调里拿不到光标框（Chromium 常见）→ 另起一个
+    // **只读编辑会话**重试。不能就地重试：同一个 edit cookie 下布局还没更新。
+    _RequestGhostSnapshot(pContext);
     return;
   }
 
@@ -402,6 +469,47 @@ void WeaselTSF::_UpdateGhostSnapshot(ITfContext* pContext,
   LlmLog(L"snapshot accepted prefix=" + snapshot.prefix);
   m_ghostEngine->OnSnapshot(snapshot);
   _expSnapshotPending = FALSE;
+}
+
+// [GHOST-FIX-012] 在**独立申请的只读编辑会话**里采集快照。
+// 与候选窗定位（Composition.cpp 的 CGetTextExtentEditSession，
+// 用 TF_ES_ASYNCDONTCARE | TF_ES_READ 申请）是同一条已验证在 Chromium 里可用的路子。
+class CCollectGhostSnapshotEditSession : public CEditSession {
+ public:
+  CCollectGhostSnapshotEditSession(com_ptr<WeaselTSF> pTextService,
+                                   com_ptr<ITfContext> pContext)
+      : CEditSession(pTextService, pContext) {}
+
+  STDMETHODIMP DoEditSession(TfEditCookie ec) {
+    // com_ptr 就是 ATL::CComPtr，没有 .get()，靠隐式转换拿裸指针
+    _pTextService->_UpdateGhostSnapshot(_pContext, ec);
+    return S_OK;
+  }
+};
+
+void WeaselTSF::_RequestGhostSnapshot(ITfContext* pContext) {
+  if (!m_ghostEngine || pContext == nullptr)
+    return;
+  if (_ghost_retry_budget <= 0) {
+    LlmLog(L"ghost retry skipped: budget exhausted");
+    return;
+  }
+  com_ptr<ITfContext> context;
+  if (FAILED(pContext->QueryInterface(IID_ITfContext, (LPVOID*)&context)) ||
+      context == nullptr) {
+    LlmLog(L"ghost retry skipped: QI ITfContext failed");
+    return;
+  }
+  _ghost_retry_budget--;
+  com_ptr<CCollectGhostSnapshotEditSession> session;
+  session.Attach(new CCollectGhostSnapshotEditSession(this, context));
+  if (session == nullptr)
+    return;
+  HRESULT hr = E_FAIL;
+  context->RequestEditSession(_tfClientId, session,
+                              TF_ES_ASYNCDONTCARE | TF_ES_READ, &hr);
+  LlmLog(L"ghost retry edit session hr=" + GhostHrText(hr) +
+         L" budget_left=" + std::to_wstring(_ghost_retry_budget));
 }
 
 // [GHOST-020 STALE-DROP] A snapshot is only collected after an IME commit, so

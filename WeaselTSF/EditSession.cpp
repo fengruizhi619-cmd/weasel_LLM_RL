@@ -36,6 +36,9 @@ STDMETHODIMP WeaselTSF::DoEditSession(TfEditCookie ec) {
       compositionEnded = true;
       _committed = TRUE;
       _expSnapshotPending = TRUE;
+      // [GHOST-FIX-012] 每次请求新快照时把重试预算充满。采集失败不再"一锤子买卖"：
+      // Chromium 要等布局就绪才给得出光标框，得给几次重试机会。
+      _ghost_retry_budget = 3;
     } else {
       _committed = FALSE;
     }

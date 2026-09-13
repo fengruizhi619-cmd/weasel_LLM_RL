@@ -171,7 +171,6 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   DWORD _dwThreadFocusSinkCookie;
 
   BOOL _InitTextEditSink(com_ptr<ITfDocumentMgr> pDocMgr);
-  void _UpdateGhostSnapshot(ITfContext* pContext, TfEditCookie ecReadOnly);
 
   BOOL _InitKeyEventSink();
   void _UninitKeyEventSink();
@@ -193,6 +192,13 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   bool _ReadGhostPrefix(ITfContext* pContext, TfEditCookie ecReadOnly,
                         std::wstring* prefix, LONG* caret, RECT* caret_rect);
   void _SyncGhostDocument(ITfContext* pContext, TfEditCookie ecReadOnly);
+  /* [GHOST-FIX-012] 采集快照本来只在 OnEndEdit 回调里做，但 Chromium（Chrome /
+   * Electron）在那个回调里给不出光标框（实测 DSH Desktop 连续 106 次
+   * "caret rect unavailable"），而同进程的候选窗定位却正常 —— 差别就在于后者是在
+   * **独立申请的只读编辑会话**里调 GetTextExt。所以把采集也搬到编辑会话里，
+   * 并留一个带预算的重试（布局就绪后再试）。 */
+  void _UpdateGhostSnapshot(ITfContext* pContext, TfEditCookie ecReadOnly);
+  void _RequestGhostSnapshot(ITfContext* pContext);
   bool _HasGhostPrediction();
   void _HideGhostPrediction();
  private:
@@ -249,6 +255,9 @@ class WeaselTSF : public ITfTextInputProcessorEx,
   /* LLM ghost prediction engine (in-process, talks to local llama-server) */
   std::unique_ptr<weasel::ghost::Engine> m_ghostEngine;
   BOOL _expSnapshotPending = FALSE;
+  /* [GHOST-FIX-012] 采集重试预算：每次请求新快照时重置，防在布局迟迟不就绪的应用里
+   * 无限重试。取不到光标框只意味着"这次画不出来"，不该拖住输入。 */
+  int _ghost_retry_budget = 0;
 
   // guidatom for the display attibute.
   TfGuidAtom _gaDisplayAttributeInput;

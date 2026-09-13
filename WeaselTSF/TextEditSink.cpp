@@ -67,10 +67,21 @@ STDMETHODIMP WeaselTSF::OnEndEdit(ITfContext* pContext,
 STDMETHODIMP WeaselTSF::OnLayoutChange(ITfContext* pContext,
                                        TfLayoutCode lcode,
                                        ITfContextView* pContextView) {
-  if (!_IsComposing())
+  if (pContext != _pTextEditSinkContext)
     return S_OK;
 
-  if (pContext != _pTextEditSinkContext)
+  // [GHOST-FIX-012] 原来这里第一句是 `if (!_IsComposing()) return S_OK;`，
+  // 于是**布局就绪这个唯一能救回快照的时机被整个跳过了**。
+  // Chromium（Chrome / Electron）在 OnEndEdit 里给不出光标框，但布局变化之后就能给；
+  // 此时快照请求（_expSnapshotPending）仍悬着，所以在补一次采集。
+  // 必须另起只读编辑会话（本回调没有 edit cookie），且只在非组字态做。
+  if (_expSnapshotPending && !_IsComposing() && !_status.composing &&
+      m_ghostEngine) {
+    _RequestGhostSnapshot(pContext);
+    return S_OK;
+  }
+
+  if (!_IsComposing())
     return S_OK;
 
   if (lcode == TF_LC_CHANGE)
