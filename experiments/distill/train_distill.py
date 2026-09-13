@@ -65,6 +65,8 @@ ARMS = {           # 臂名 -> (uniq 层数, loops 轮数)；等效深度 = uniq
     # —— 插入式蒸馏：监督点落在"每 U 层一个循环边界"上 ——
     "u2t14": (2, 14),       # 每 2 层一个监督点，等效深度 28（教师深度）
     "u2t5": (2, 5),         # 每 2 层一个监督点，等效深度 10（便宜迭代臂）
+    "u1t9": (1, 9),         # 非均匀折叠专用：9 轮，配 --ins-depths 让轮次按教师真实
+                            #   计算密度分配（浅层大步、深层小步），9 层前向 vs 教师 28
 }
 
 
@@ -199,7 +201,29 @@ def make_windows(tokenizer, text, seq_len, device, limit=0):
 
 # ---------------------------------------------------------------- 插入式蒸馏
 
-def boundary_depths(arm_uniq, arm_loops, teacher_layers, mapping="head"):
+def parse_depths(spec, loops):
+    """解析显式的边界深度表：--ins-depths "4,8,12,16,20,22,24,26,28"。
+
+    为什么要这个：教师 28 层的计算**极不均匀**（实测前 20 层纯建特征、后 8 层才预测），
+    所以"每轮均匀推进 U 层"本身就是错的分配 —— 9 轮均匀铺 28 层，每轮要做 3 层的活，
+    而教师那 3 层的性质在浅层和深层完全不同。显式深度表让轮次按教师的**真实计算密度**
+    分配：浅层大步、深层小步。
+    """
+    if not spec:
+        return None
+    try:
+        ds = [int(x) for x in str(spec).replace("，", ",").split(",") if x.strip()]
+    except ValueError:
+        raise SystemExit("--ins-depths 必须是逗号分隔的整数，如 4,8,12,16,20,22,24,26,28")
+    if len(ds) != loops:
+        raise SystemExit("--ins-depths 有 %d 个深度，但该臂是 %d 轮循环，必须一一对应"
+                         % (len(ds), loops))
+    if any(d < 1 for d in ds) or ds != sorted(ds):
+        raise SystemExit("--ins-depths 必须是从小到大、都 >=1 的深度")
+    return ds
+
+
+def boundary_depths(arm_uniq, arm_loops, teacher_layers, mapping="head", explicit=None):
     """学生第 t 轮（1 基）的循环边界该对齐教师第几层。返回 list[loops]。
 
     mapping="head"：d_t = t · U（从头对齐）—— "学生每 U 层对应教师前 U 层"。
@@ -215,6 +239,8 @@ def boundary_depths(arm_uniq, arm_loops, teacher_layers, mapping="head"):
     教师的特征构建段（目标读出精度 0.002~0.009）。tail 映射把同样的 8 轮锚到 21~28 层。
     """
     L = int(teacher_layers)
+    if explicit:
+        return [max(1, min(L, d)) for d in explicit]
     out = []
     for t in range(1, arm_loops + 1):
         d = (t * arm_uniq) if mapping == "head" else (L - (arm_loops - t) * arm_uniq)
@@ -228,7 +254,8 @@ def make_insertion_plan(arm_uniq, arm_loops, teacher_layers, args, depth_acc=Non
     返回 dict：depths=list[T]（每轮的教师对齐层）、hint=list[T]（0/1 权重）、
               logit=list[T]（0/1 是否插输出级监督）
     """
-    depths = boundary_depths(arm_uniq, arm_loops, teacher_layers, args.ins_map)
+    depths = boundary_depths(arm_uniq, arm_loops, teacher_layers, args.ins_map,
+                             explicit=parse_depths(args.ins_depths, arm_loops))
     hint = [args.ins_hint_w] * arm_loops if args.ins_hint_w > 0 else [0.0] * arm_loops
     logit = [0.0] * arm_loops
     if args.ins_logit_w > 0:
@@ -276,7 +303,23 @@ def teacher_depth_targets(teacher, xb, depths, need_logit, temp):
     return {"hints": hints, "t_prob": t_prob, "t_top1": t_top1, "t_final_prob": t_final_prob}
 
 
-def insertion_terms(student_h, plan, targets, grad_logits, temp, hint_kind="cos"):
+def relation_matrix(h, eps=1e-6):
+    """把 (B,L,D) 的表示压成 (B,L,L) 的**token 间相似度结构**（L2 归一化后的点积）。
+
+    为什么需要这个：hidden 的逐点余弦只约束"每个 token 的方向"，管不到 token 之间的
+    结构 —— 而"折叠深度"要迁移的恰恰是**计算模式**（哪些 token 在互相看、信息怎么流），
+    不是单个 token 的坐标。相似度矩阵把这一层结构显式暴露出来，代价几乎为零
+    （(B,L,L) 而已，教师侧不需要任何额外前向、不需要 eager attention）。
+
+    这是相似性保持蒸馏（RKD / FSP 矩阵那条线）的最小形式。
+    """
+    z = h.float()
+    z = z / (z.norm(dim=-1, keepdim=True) + eps)
+    return z @ z.transpose(-1, -2)
+
+
+def insertion_terms(student_h, plan, targets, grad_logits, temp, hint_kind="cos",
+                    rel_w=0.0):
     """算出插入式蒸馏的各附加损失项。全部返回 (标量 tensor 或 None, 统计 dict)。
 
     **按监督点个数取均值**，不是求和：否则 u1t28（28 个边界）的总 hint 权重会是
@@ -303,6 +346,24 @@ def insertion_terms(student_h, plan, targets, grad_logits, temp, hint_kind="cos"
         n_hint += 1
     if hint_loss is not None and n_hint:
         hint_loss = hint_loss / n_hint
+
+    rel_loss, n_rel = None, 0
+    if rel_w > 0:
+        for t, (w, d) in enumerate(zip(plan["hint"], plan["depths"])):
+            if t >= len(student_h):
+                continue
+            ws = w if w > 0 else 1.0
+            ss = relation_matrix(student_h[t])
+            st_t = relation_matrix(targets["hints"][d])
+            per = F.mse_loss(ss, st_t, reduction="none").mean(-1)
+            st["ins_rel_t%d" % (t + 1)] = float(per.mean())
+            term = per.mean() * ws * rel_w
+            rel_loss = term if rel_loss is None else rel_loss + term
+            n_rel += 1
+            del ss, st_t
+        if rel_loss is not None and n_rel:
+            rel_loss = rel_loss / n_rel
+
     logit_loss, n_logit = None, 0
     for t, (w, d) in enumerate(zip(plan["logit"], plan["depths"])):
         if w <= 0 or (t + 1) not in grad_logits:
@@ -319,13 +380,13 @@ def insertion_terms(student_h, plan, targets, grad_logits, temp, hint_kind="cos"
         del s_log, kl
     if logit_loss is not None and n_logit:
         logit_loss = logit_loss / n_logit
-    return hint_loss, logit_loss, st
+    return hint_loss, rel_loss, logit_loss, st
 
 
 # ---------------------------------------------------------------- 训练
 
 def distillation_step(student, teacher, xb, yb, temp, alpha_ce, device,
-                      ins_plan=None, hint_kind="cos", want_stats=True):
+                      ins_plan=None, hint_kind="cos", want_stats=True, ins_rel_w=0.0):
     """返回 (loss, 统计)。教师概率算完即释放 logits，只留 probs（省显存）。
 
     ins_plan 不为 None 时启用**插入式蒸馏**：在每轮循环边界插表示(hint)监督、
@@ -363,12 +424,14 @@ def distillation_step(student, teacher, xb, yb, temp, alpha_ce, device,
 
     st = {}
     if ins_plan is not None:
-        h_loss, l_loss, ist = insertion_terms(aux.get("round_hidden") or [],
-                                              ins_plan, tg,
-                                              aux.get("round_logits_grad") or {}, temp, hint_kind)
+        h_loss, r_loss, l_loss, ist = insertion_terms(
+            aux.get("round_hidden") or [], ins_plan, tg,
+            aux.get("round_logits_grad") or {}, temp, hint_kind, rel_w=ins_rel_w)
         st.update(ist)
         if h_loss is not None:
             loss = loss + h_loss
+        if r_loss is not None:
+            loss = loss + r_loss
         if l_loss is not None:
             loss = loss + l_loss
         del t_prob
@@ -494,6 +557,13 @@ def main():
                     help="带梯度的逐轮 logits 最多留最后 K 轮（显存约束）")
     ap.add_argument("--ins-map", default="head", choices=["head", "tail"],
                     help="深度对齐映射：head=t·U（从头）；tail=L-(T-t)·U（从尾，锚在教师精修段）")
+    ap.add_argument("--ins-depths", default="",
+                    help="显式边界深度表（逗号分隔，个数必须等于轮数）—— 非均匀折叠："
+                         "教师计算密度不均（前 20 层建特征、后 8 层做预测），"
+                         "浅层应大步、深层应小步，如 \"4,8,12,16,20,22,24,26,28\"")
+    ap.add_argument("--ins-rel-w", type=float, default=0.0,
+                    help="循环边界**关系(相似度结构)**监督的权重；0=关。"
+                         "逐点余弦管不到 token 之间的结构，而折叠要迁移的正是计算模式")
     ap.add_argument("--smoke", action="store_true", help="只抽 200 条 / 跑 20 步 / 跳过留出评估")
     ap.add_argument("--teacher-baseline", action="store_true", default=True,
                     help="打印/记录教师自身在留出集上的 top1（蒸馏上限参照）")
@@ -546,7 +616,7 @@ def main():
 
     # ---- 插入式蒸馏计划：把监督点铺到循环边界上 ----
     ins_plan = None
-    if args.ins_hint_w > 0 or args.ins_logit_w > 0:
+    if args.ins_hint_w > 0 or args.ins_logit_w > 0 or args.ins_rel_w > 0:
         depth_acc = None
         if args.ins_logit_w > 0 and args.ins_logit_tau > 0:
             p = os.path.join(HERE, "probe_depth_result.json")
@@ -561,10 +631,12 @@ def main():
                     log("逐层曲线载入失败（%s）→ tau 过滤退化为全插" % e)
         ins_plan = make_insertion_plan(uniq, loops, teacher.config.num_hidden_layers,
                                        args, depth_acc)
-        log("插入式蒸馏：map=%s 边界深度=%s" % (args.ins_map, ins_plan["depths"]))
-        log("  hint 权重 %s ｜ logit 权重 %s（tau=%.2f，最多带梯度 %d 轮）"
-            % (ins_plan["hint"], ins_plan["logit"], args.ins_logit_tau, args.ins_logit_rounds))
-        if not any(ins_plan["hint"]) and not any(ins_plan["logit"]):
+        log("插入式蒸馏：map=%s 边界深度=%s"
+            % ("explicit" if args.ins_depths else args.ins_map, ins_plan["depths"]))
+        log("  hint 权重 %s ｜ 关系 权重 %.2f ｜ logit 权重 %s（tau=%.2f，最多带梯度 %d 轮）"
+            % (ins_plan["hint"], args.ins_rel_w, ins_plan["logit"],
+               args.ins_logit_tau, args.ins_logit_rounds))
+        if not any(ins_plan["hint"]) and not any(ins_plan["logit"]) and args.ins_rel_w <= 0:
             raise SystemExit("插入式蒸馏开了但所有监督点权重为 0，检查 --ins-* 参数")
         if args.ins_logit_w > 0 and not any(ins_plan["logit"]):
             # 静默无监督是最糟的失败模式：命令看着成功、其实没插任何输出级监督。
@@ -688,7 +760,8 @@ def main():
             ptr += args.micro
             loss, st = distillation_step(student, teacher, xb, yb, args.temp,
                                          args.alpha_ce, device,
-                                         ins_plan=ins_plan, hint_kind=args.ins_hint_kind)
+                                         ins_plan=ins_plan, hint_kind=args.ins_hint_kind,
+                                         ins_rel_w=args.ins_rel_w)
             (loss / micro_per_step).backward()
             for k, v in st.items():
                 acc_stats[k] = acc_stats.get(k, 0.0) + v / micro_per_step
