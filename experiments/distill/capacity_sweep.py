@@ -34,7 +34,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------- 数据
 
-def reconstruct_stream(lines):
+def reconstruct_stream(lines, sep=""):
+    """打字行是**渐进全量快照**（"现在用"→"现在用新的"，每行 = 到此刻为止的全文）。
+    直接拼接会让同一段文本被喂几十遍（D0490 踩过），必须重建唯一文本流：
+    若当前行以前一行开头，只取新增部分；否则另起一段（sep 不为空时在段间插入分隔符）。"""
     parts, prev = [], ""
     for ln in lines:
         if not ln:
@@ -42,7 +45,7 @@ def reconstruct_stream(lines):
         if prev and ln.startswith(prev):
             parts.append(ln[len(prev):])
         else:
-            parts.append(ln)
+            parts.append((sep if parts else "") + ln)
         prev = ln
     return "".join(parts)
 
