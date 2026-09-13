@@ -134,6 +134,61 @@ def build_char_model(vocab_size, hidden, layers):
     return Qwen3ForCausalLM(cfg)
 
 
+class _LogitsOut:
+    """统一 model(x).logits 接口：Qwen3ForCausalLM 返回 CausalLMOutput，循环块返回这个。"""
+
+    def __init__(self, logits):
+        self.logits = logits
+
+
+class LoopedLM(torch.nn.Module):
+    """循环 Transformer（Universal Transformer 式）：U=1 个共享层循环 rounds 次。
+    循环的**价值是参数效率**（同有效深度下参数约 1/3，实测 D0112 只差 0.0024 AUC），
+    所以"缩小 4 倍参数 + 循环补深度"在理论上是可行的组合。"""
+
+    def __init__(self, vocab_size, hidden, rounds, rope_theta=1e6):
+        super().__init__()
+        from transformers import Qwen3Config, Qwen3Model
+        heads = 1 if hidden < 64 else (2 if hidden < 128 else 4)
+        self.heads = heads
+        self.head_dim = hidden // heads
+        self.rounds = rounds
+        self.rope_theta = rope_theta
+        cfg = Qwen3Config(
+            vocab_size=vocab_size, hidden_size=hidden, intermediate_size=hidden * 4,
+            num_hidden_layers=1, num_attention_heads=heads,
+            num_key_value_heads=heads, head_dim=self.head_dim,
+            max_position_embeddings=4096, rope_theta=rope_theta, rms_norm_eps=1e-6,
+            attention_dropout=0.0,
+        )
+        base = Qwen3Model(cfg)
+        self.embed = base.embed_tokens
+        self.layer = base.layers[0]          # 唯一共享层，循环 rounds 次
+        self.round_emb = torch.nn.Embedding(rounds, hidden)
+        torch.nn.init.zeros_(self.round_emb.weight)   # 零初始化起步，先不干扰
+        self.norm = base.norm
+        self.lm_head = torch.nn.Linear(hidden, vocab_size, bias=False)
+        self.lm_head.weight = self.embed.weight       # tie 词嵌入
+
+    def forward(self, input_ids):
+        B, Ln = input_ids.shape
+        dev = input_ids.device
+        position_ids = torch.arange(Ln, device=dev).unsqueeze(0).expand(B, Ln)
+        h = self.embed(input_ids)
+        # 与 student_looped._rotary 同一算法：cos/sin 三维 (B,L,head_dim)，别补 heads 维
+        inv_freq = 1.0 / (self.rope_theta ** (
+            torch.arange(0, self.head_dim, 2, dtype=torch.float32, device=dev) / self.head_dim))
+        freqs = torch.einsum("bl,d->bld", position_ids.float(), inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos, sin = emb.cos().to(h.dtype), emb.sin().to(h.dtype)
+        for t in range(self.rounds):
+            h = h + self.round_emb(torch.full((B,), t, device=dev))[:, None, :]
+            # Qwen3DecoderLayer 返回裸 tensor；mask 传 None 走 SDPA/GQA 内核
+            h = self.layer(h, attention_mask=None, position_ids=position_ids,
+                           position_embeddings=(cos, sin))
+        return _LogitsOut(self.lm_head(self.norm(h)))
+
+
 @torch.no_grad()
 def topk_acc(model, x, y, device, k_list=(1, 5, 10), limit=None):
     model.eval()
@@ -167,6 +222,15 @@ SWEEP = [
     ("d256_l2", 256, 2),
     ("d256_l4", 256, 4),
     ("d512_l4", 512, 4),
+]
+
+# 循环变体：(名字, hidden, rounds) —— 参数与 dXX_l1 相同，但有效深度 ×rounds。
+# 依据 D0112：循环 = 参数效率工具，同有效深度下循环约 1/3 参数、质量持平。
+LOOP_SWEEP = [
+    ("loop_d32_t4", 32, 4),    # 0.05M，有效深度 4 —— 比 plain d64_l1(0.13M) 小 2.6x
+    ("loop_d32_t8", 32, 8),    # 0.05M，有效深度 8（D0112: 过深会轻微过拟合，作对照）
+    ("loop_d64_t2", 64, 2),    # 0.13M，有效深度 2
+    ("loop_d64_t4", 64, 4),    # 0.13M，有效深度 4
 ]
 
 
@@ -209,15 +273,24 @@ def main():
     print("训练窗口 %d ｜ 留出窗口 %d\n" % (x.size(0), xh.size(0)))
 
     if args.sizes == "all":
-        sizes = SWEEP
+        sizes = [("plain",) + s for s in SWEEP] + [("loop",) + s for s in LOOP_SWEEP]
     else:
         want = set(x.strip() for x in args.sizes.split(","))
-        sizes = [s for s in SWEEP if s[0] in want]
+        sizes = ([("plain",) + s for s in SWEEP if s[0] in want] +
+                 [("loop",) + s for s in LOOP_SWEEP if s[0] in want])
     rows = []
-    for name, hidden, layers in sizes:
-        model = build_char_model(len(vocab), hidden, layers).to(device)
+    for kind, name, a, b in sizes:
+        if kind == "plain":
+            model = build_char_model(len(vocab), a, b)
+            eff = b
+            tag = "d=%d L=%d 有效深度=%d" % (a, b, eff)
+        else:
+            model = LoopedLM(len(vocab), a, b)
+            eff = b                       # 循环模型的有效深度 = 轮数（同一层应用几次）
+            tag = "d=%d T=%d 有效深度=%d" % (a, b, eff)
+        model = model.to(device)
         nparams = sum(p.numel() for p in model.parameters())
-        print("=== %s  参数 %.2fM  d=%d L=%d ===" % (name, nparams / 1e6, hidden, layers), flush=True)
+        print("=== %s  参数 %.2fM  %s ===" % (name, nparams / 1e6, tag), flush=True)
         opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.05)
         warm = args.warmup
         def lr_lambda(s):
@@ -256,8 +329,8 @@ def main():
         tr = topk_acc(model, x, y, device, (1, 5, 10))
         ho = topk_acc(model, xh, yh, device, (1, 5, 10))
         gap = tr[5] - ho[5]
-        rows.append({"name": name, "hidden": hidden, "layers": layers,
-                     "params": nparams, "train": tr, "hold": ho,
+        rows.append({"name": name, "kind": kind, "hidden": a, "b": b,
+                     "eff_depth": eff, "params": nparams, "train": tr, "hold": ho,
                      "hold_top5_best": best_hold, "gap": gap})
         print("  训练 top1/5/10 = %.3f/%.3f/%.3f  ｜ 留出 = %.3f/%.3f/%.3f  ｜ 差距(top5)=%.3f"
               % (tr[1], tr[5], tr[10], ho[1], ho[5], ho[10], gap), flush=True)
