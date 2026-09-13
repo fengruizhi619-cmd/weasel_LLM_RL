@@ -8,6 +8,7 @@ next_sentence_result.json
 # 上传/训练产物
 distill_v1_*.zip
 runs/
+runs_small/
 logs/
 __pycache__/
 *.pyc
