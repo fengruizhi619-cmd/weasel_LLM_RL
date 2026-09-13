@@ -135,28 +135,43 @@ def build_corpus(args):
         typing = typing[:-k]
         log("打字域留出 %d 行 / %d 字" % (k, len(hold_typing)))
 
+    # 小说留出必须**切在混料之前**。
+    # 踩过：早先是先 shuffle 混料、再拿 `text[cut:]` 当小说留出，于是那个"小说留出集"
+    # 其实是混料尾部 —— 里面按同样比例掺进了打字语料。症状很好认：教师自己在
+    # "小说留出集"上的 top1 会随 --mix-typing 变（实测 0.3252 → 0.2510），
+    # 而教师上限本该是常数。打字留出集因为切在混料之前，一直是干净的。
+    cut = int(len(novel) * (1 - args.holdout))
+    tr_novel, hold_novel = novel[:cut], novel[cut:]
+    log("小说留出 %d 字（干净：不含打字语料）" % len(hold_novel))
+
     # 按字符配比把打字数据摊进小说流（逐行交替插入，不破坏窗口连续性）
-    if typing and args.mix_typing > 0:
+    share = min(1.0, max(0.0, args.mix_typing))
+    if typing and share >= 0.95:
+        # share=1.0 时 1-share=0，旧写法 want_typ 会除爆成 1e14，把小说也全带上，
+        # 于是"纯打字"跑出来其实是"小说+全部打字"。这里显式短路。
+        text = "\n".join(typing)
+        log("只用打字语料（%d 字）" % sum(map(len, typing)))
+    elif typing and share > 0:
         novel_parts, typ_parts = [], []
-        want_typ = len(novel) * args.mix_typing / max(1e-9, 1 - args.mix_typing)
+        want_typ = len(tr_novel) * share / max(1e-9, 1 - share)
         acc, i = 0, 0
-        for ln in novel.split("\n"):
+        n_lines = max(1, len(tr_novel.split("\n")))
+        for ln in tr_novel.split("\n"):
             novel_parts.append(ln)
-            while i < len(typing) and acc < want_typ * (len(novel_parts) / max(1, len(novel.split("\n")))):
+            while i < len(typing) and acc < want_typ * (len(novel_parts) / n_lines):
                 typ_parts.append(typing[i]); acc += len(typing[i]); i += 1
         merged = novel_parts + typ_parts
         random.Random(args.seed).shuffle(merged)   # 打散，避免"前半小说后半打字"
         text = "\n".join(merged)
         log("混料：小说 %d 字 + 打字 %d 字 → 打字占比约 %.0f%%"
-            % (len(novel), acc, 100.0 * acc / max(1, len(novel) + acc)))
+            % (len(tr_novel), acc, 100.0 * acc / max(1, len(tr_novel) + acc)))
     else:
-        text = novel
+        text = tr_novel
         log("只用小说（--mix-typing 0）")
 
     if len(text) < 10000:
         raise SystemExit("语料太小（%d 字）" % len(text))
-    cut = int(len(text) * (1 - args.holdout))
-    return text[:cut], text[cut:], hold_typing
+    return text, hold_novel, hold_typing
 
 
 def make_windows(tokenizer, text, seq_len, device, limit=0):
