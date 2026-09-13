@@ -458,28 +458,60 @@ def distillation_step(student, teacher, xb, yb, temp, alpha_ce, device,
 
 
 @torch.no_grad()
-def teacher_acc(teacher, x, y, device, max_batches=4):
-    """教师自己在留出集上的 top1 准确率 —— **蒸馏上限的参照线**。
+def teacher_acc(teacher, x, y, device, max_batches=0, cap=32):
+    """教师自己在给定窗口上的 top1 准确率 —— **蒸馏上限的参照线**。
 
-    没有这个数，学生的 student_acc 无法解读：0.38 到底是"学生差"还是"这个任务本身就
-    只有 0.45 可拿"，只有教师自己打出的分才说得清。
+    踩过的坑（口径不可比）：早先这里默认 `max_batches=4` 且 batch=1，而学生评测走的是
+    `evaluate(max_batches=8)`，**两边用的窗口子集不同**，于是"上限"与"学生"根本不在同一
+    批输入上 —— 同一个小说留出集，教师上限被这个口径测出过 0.3252 / 0.4014 / 0.4287
+    三个值（4/12/24 个窗口）。那个"差距=上限-学生"列因此不可信。
+    现在默认 `max_batches=0` = 尽量用满留出集（上限 cap），学生侧也走同一个数。
     """
     teacher.eval()
-    acc = 0.0
-    nb = min(max_batches, x.size(0))
+    n_all = x.size(0)
+    nb = n_all if max_batches <= 0 else min(max_batches, n_all)
+    nb = min(nb, cap)
+    if nb <= 0:
+        return 0.0, 0
+    hit = torch.zeros((), device=device)
+    tot = 0
     for i in range(nb):
         lg = teacher(x[i:i + 1]).logits
-        acc += float((lg.argmax(-1) == y[i:i + 1]).float().mean())
-    return acc / max(nb, 1)
+        hit = hit + (lg.argmax(-1) == y[i:i + 1]).float().sum()
+        tot += y[i:i + 1].numel()
+        del lg
+    return float(hit / max(tot, 1)), nb
 
 
 @torch.no_grad()
-def evaluate(student, teacher, x, y, temp, device, max_batches=8, collect_rounds=True):
+def fit_verdict(t_train, s_train, t_hold, s_hold):
+    """判据：欠拟合还是过拟合 —— 这决定"数据不够"这个解释成不成立。
+
+    过拟合（训练高、留出低）→ 有可能是数据量问题；欠拟合（两边都低、都远离教师）
+    → **一定不是数据量问题**（欠拟合加数据没用，只能改函数类/目标/优化）。
+    """
+    tg = t_train - s_train
+    hg = t_hold - s_hold
+    if t_train <= 0 or t_hold <= 0:
+        return "无教师参照，无法判定"
+    if hg > max(tg, 0.02) * 1.6:
+        return "过拟合迹象（留出差距 %.3f >> 训练差距 %.3f）→ 可能是数据量问题" % (hg, tg)
+    if tg > 0.25 and hg > 0.25:
+        return ("欠拟合（训练差距 %.3f、留出差距 %.3f，两边都远离教师）→ "
+                "**不是数据量问题**：加数据治不好，要改可学函数类/目标/初始化" % (tg, hg))
+    return "介于两者之间（训练差距 %.3f、留出差距 %.3f）" % (tg, hg)
+
+
+@torch.no_grad()
+def evaluate(student, teacher, x, y, temp, device, max_batches=0, collect_rounds=True, cap=32):
+    """max_batches<=0 = 用满留出集（上限 cap 个窗口）。必须与 teacher_acc 用同一个数，
+    否则"上限 - 学生"这个差距是拿两批不同输入相减，没有意义。"""
     student.eval()
     agg = {"kl": 0.0, "agree_top1": 0.0, "student_acc": 0.0}
     n = 0
     round_acc = None
-    nb = min(max_batches, x.size(0))
+    nb = x.size(0) if max_batches <= 0 else min(max_batches, x.size(0))
+    nb = min(nb, cap)
     for i in range(nb):
         xb, yb = x[i:i + 1], y[i:i + 1]
         t_logits = teacher(xb).logits
@@ -527,6 +559,9 @@ def main():
     ap.add_argument("--grad-clip", type=float, default=1.0)
     ap.add_argument("--temp", type=float, default=2.0)
     ap.add_argument("--alpha-ce", type=float, default=0.5, help="硬标签 CE 的权重")
+    ap.add_argument("--eval-batches", type=int, default=16,
+                    help="评测/教师上限用的窗口数（<=0 表示用满留出集）。"
+                         "**教师上限与学生必须同一个数**，否则差距列不可信")
     ap.add_argument("--eval-every", type=int, default=200)
     ap.add_argument("--holdout", type=float, default=0.1)
     ap.add_argument("--novel", default=os.environ.get(
@@ -701,20 +736,32 @@ def main():
            "" if not bb else "，主干 lr=%.1e" % (args.lr_backbone or args.lr / 10)))
 
     # 阈值参照：先算教师自己在留出集上的 top1（smoke 路径跳过，保持快）
-    t_novel = t_typing = None
+    # **口径必须与学生评测一致**：教师上限与学生用同一批窗口，否则"差距"列不可信。
+    t_novel = t_typing = t_train = None
     if not args.smoke:
+        ev_b = args.eval_batches
         if args.teacher_baseline:
-            t_novel = teacher_acc(teacher, xv, yv, device, max_batches=4)
-            log("[上限·小说留出] 教师自身 top1 = %.4f" % t_novel)
+            t_novel, nb_n = teacher_acc(teacher, xv, yv, device, max_batches=ev_b)
+            log("[上限·小说留出] 教师自身 top1 = %.4f（%d 窗口，与学生同批）" % (t_novel, nb_n))
             if xt is not None:
-                t_typing = teacher_acc(teacher, xt, yt, device, max_batches=4)
-                log("[上限·打字留出] 教师自身 top1 = %.4f" % t_typing)
-        ev0 = evaluate(student, teacher, xv, yv, args.temp, device, max_batches=4)
+                t_typing, nb_t = teacher_acc(teacher, xt, yt, device, max_batches=ev_b)
+                log("[上限·打字留出] 教师自身 top1 = %.4f（%d 窗口）" % (t_typing, nb_t))
+            # 训练窗口上的教师上限：没有这个数就分不清"欠拟合"和"过拟合"，
+            # 而这两者的解法完全不同（欠拟合加数据没用）。
+            t_train, nb_tr = teacher_acc(teacher, x, y, device, max_batches=ev_b)
+            log("[上限·训练窗口] 教师自身 top1 = %.4f（%d 窗口，抽样）" % (t_train, nb_tr))
+        ev0 = evaluate(student, teacher, xv, yv, args.temp, device, max_batches=ev_b)
         log("[基线·小说留出] kl=%.4f agree_top1=%.4f student_acc=%.4f%s"
             % (ev0["kl"], ev0["agree_top1"], ev0["student_acc"],
                "" if t_novel is None else "（教师 %.4f）" % t_novel))
+        if t_train is not None:
+            s_tr = evaluate(student, teacher, x, y, args.temp, device,
+                            max_batches=ev_b, collect_rounds=False)
+            log("[基线·判定] 训练窗口学生 acc=%.4f（教师 %.4f）→ %s"
+                % (s_tr["student_acc"], t_train,
+                   fit_verdict(t_train, s_tr["student_acc"], t_novel, ev0["student_acc"])))
         if xt is not None:
-            et0 = evaluate(student, teacher, xt, yt, args.temp, device, max_batches=4)
+            et0 = evaluate(student, teacher, xt, yt, args.temp, device, max_batches=ev_b)
             log("[基线·打字留出] kl=%.4f agree_top1=%.4f student_acc=%.4f%s"
                 % (et0["kl"], et0["agree_top1"], et0["student_acc"],
                    "" if t_typing is None else "（教师 %.4f）" % t_typing))
@@ -738,7 +785,8 @@ def main():
                  "ins_plan": ins_plan,          # 插入式蒸馏的完整计划（含每个边界对齐的教师深度）
                  "train_scope": args.train_scope,
                  "train_windows": int(x.size(0)), "holdout_windows": int(xv.size(0)),
-                 "teacher_acc_novel": t_novel, "teacher_acc_typing": t_typing})
+                 "teacher_acc_novel": t_novel, "teacher_acc_typing": t_typing,
+                 "teacher_acc_train": t_train})
     with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
@@ -782,10 +830,11 @@ def main():
                    acc_stats["student_acc"], sched.get_last_lr()[0], time.time() - t0, extra))
 
         if step % args.eval_every == 0 or step == args.steps:
-            ev = evaluate(student, teacher, xv, yv, args.temp, device,
+            ev = evaluate(student, teacher, xv, yv, args.temp, device, max_batches=args.eval_batches,
                           collect_rounds=(step == args.steps or step % (args.eval_every * 5) == 0))
             rec = {"step": step, **acc_stats, **{k: v for k, v in ev.items() if k != "round_agree"}}
             rec["teacher_acc_novel"] = t_novel       # 上限参照，随每行落盘，绘图时可直接画平行线
+            rec["teacher_acc_train"] = t_train
             if "round_agree" in ev:
                 ra = ev["round_agree"]
                 rec["round_agree"] = ra
@@ -795,7 +844,8 @@ def main():
             if xt is not None:
                 # 打字域也收早退曲线：插入式蒸馏的**产品收益**就在这条线上 ——
                 # 第 t 轮就能用，意味着在线推理只需跑 t 轮（省算力）。
-                et = evaluate(student, teacher, xt, yt, args.temp, device, max_batches=4,
+                et = evaluate(student, teacher, xt, yt, args.temp, device,
+                              max_batches=args.eval_batches,
                               collect_rounds=(step == args.steps))
                 rec["typing_kl"] = et["kl"]
                 rec["typing_agree_top1"] = et["agree_top1"]
@@ -817,6 +867,15 @@ def main():
                     % (step, et["kl"], et["agree_top1"], et["student_acc"],
                        "" if t_typing is None else "  上限(教师)=%.4f  差距=%.4f"
                        % (t_typing, t_typing - et["student_acc"])))
+            # 判定行：欠拟合还是过拟合 —— 直接决定"数据不够"这个解释成不成立
+            if t_train is not None:
+                s_tr = evaluate(student, teacher, x, y, args.temp, device,
+                                max_batches=args.eval_batches, collect_rounds=False)
+                rec["train_student_acc"] = s_tr["student_acc"]
+                log("  [判定] 训练acc=%.4f（教师 %.4f，差距 %.3f）｜ 留出acc=%.4f（差距 %.3f）→ %s"
+                    % (s_tr["student_acc"], t_train, t_train - s_tr["student_acc"],
+                       ev["student_acc"], (t_novel or 0) - ev["student_acc"],
+                       fit_verdict(t_train, s_tr["student_acc"], t_novel, ev["student_acc"])))
 
     ckpt = os.path.join(args.out, "student.pt")
     torch.save({"state_dict": student.state_dict(), "meta": meta}, ckpt)
