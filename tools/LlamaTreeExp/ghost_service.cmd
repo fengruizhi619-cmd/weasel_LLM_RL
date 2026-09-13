@@ -1,7 +1,15 @@
 @echo off
+rem ghost_service.cmd - WeaselServer hosts the recorder (offline) or the engine (online)
+rem
+rem WHY THE PATH IS INLINE: this file used to read the repo root from ghost_home.txt via
+rem `set /p`. cmd reads that with the ANSI code page, so the moment the file is written as
+rem UTF-8 the non-ASCII characters in the path turn into mojibake, the cd below fails and
+rem the recorder/engine never starts (silently, with no window). The installer now
+rem substitutes @@GHOST_HOME@@ with the repo root so the path is a plain ASCII literal.
+rem Keep this file ASCII-only (no BOM); do NOT commit a substituted copy.
+
 chcp 936 >nul
-set "GHOST_HOME="
-if exist "%~dp0ghost_home.txt" set /p GHOST_HOME=<"%~dp0ghost_home.txt"
+set "GHOST_HOME=@@GHOST_HOME@@"
 if not defined GHOST_HOME set "GHOST_HOME=%WEASEL_LLM_HOME%"
 if not defined GHOST_HOME set "GHOST_HOME=%~dp0..\.."
 cd /d "%GHOST_HOME%\tools\LlamaTreeExp"

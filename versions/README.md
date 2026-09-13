@@ -21,12 +21,16 @@
 | cli_emojiless_RL_v2.0.zip | **第一个可正式训练的版本**：纯交叉熵 + 普通 SGD + lr 1e-5 + 打字/小说 25% 混料；新增 train_mix.py 与三指标验收；清理早期原型与死代码 | v2.0 |
 | cli_emojiless_RL_v2.0.1.zip | 解码器库与面板切换区；修面板裁切 bug；线上切到 mix_base | v2.0.1 |
 | cli_emojiless_RL_v2.0.2.zip | 看门狗改无头启动（修每 5 分钟闪窗）；注册脚本修 Duration 越界 + 加硬断言与 -DryRun；codex→DSH 残留硬路径 | v2.0.2 |
+| cli_emojiless_RL_v2.0.3.zip | 修数据面板打不开：启动器不再依赖 ghost_home.txt 的编码（安装期把仓库路径写进 .cmd）；install.ps1 加同哈希跳过与编码回读校验；新增现场修复工具 fix-ghost-launcher.ps1 | v2.0.3 |
 
 **当前工作树**
-- 基座：cli_emojiless_RL_v2.0.2（HEAD）
+- 基座：cli_emojiless_RL_v2.0.3（HEAD）
 - 活动实验：tools\LlamaTreeExp + tools\WeaselExpContextV0（外部钩子/候选树/训练）
 - 定型配置：纯交叉熵 / 普通 SGD / lr 1e-5 / 梯度裁剪关闭 / 打字:小说 = 25:75
 - 工作区位置：E:\DSH_data\研究\weasel-baseline（原 E:\codex_data\研究，已迁移）
 - 无头看门狗：计划任务动作必须是 `wscript.exe ... watchdog.vbs`，不能是 powershell.exe（会闪窗）。
   改动后需在管理员会话跑一次 output\register-task.ps1 才生效。
+- 启动器路径：ghost_*.cmd 的仓库路径由 install.ps1 在安装期以 ASCII 字面量写入（@@GHOST_HOME@@ 占位）。
+  **不要**再让它们回去读 ghost_home.txt —— cmd 的 `set /p` 按 ANSI 读，文件一旦被写成 UTF-8 就静默失效。
+  现场修复用 output\fix-ghost-launcher.ps1（带 -DryRun / -Launch）。
 - 下一步：验证超大数据量下的泛化（当前只到 1 万字、17001 步；同域 +3 点，换书换文体无数据）

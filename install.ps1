@@ -227,23 +227,48 @@ foreach ($f in $Files) {
 
 Say "3/6 复制 dll / exe"
 foreach ($f in $Files) {
-    Step $f
-    if (-not $DryRun) { Copy-Item -LiteralPath (Join-Path $src $f) -Destination (Join-Path $RimeDir $f) -Force }
-}
-
-Say "4/6 复制 ghost 脚本"
-foreach ($s in $Scripts) {
-    Step $s
-    if (-not $DryRun) {
-        Copy-Item -LiteralPath (Join-Path $RepoRoot ("tools\LlamaTreeExp\" + $s)) -Destination (Join-Path $RimeDir $s) -Force
+    $s = Join-Path $src $f
+    $d = Join-Path $RimeDir $f
+    $same = (Test-Path $d) -and ((Get-FileHash -LiteralPath $s -Algorithm SHA256).Hash -eq
+                                 (Get-FileHash -LiteralPath $d -Algorithm SHA256).Hash)
+    if ($same) {
+        # 内容一致就没有必要覆盖：weaselx64.dll 是 TSF 进程内组件，被 explorer 等进程加载时
+        # 根本写不进去，硬拷只会让整条安装中断（后面的脚本生成与注册表步骤全都跑不到）。
+        Step ($f + "  已是同一份，跳过")
+    } else {
+        Step $f
+        if (-not $DryRun) { Copy-Item -LiteralPath $s -Destination $d -Force }
     }
 }
 
-Say "5/6 写入 ghost_home.txt"
+Say "4/6 生成 ghost 脚本（把仓库路径写进 .cmd，不再依赖 ghost_home.txt 的编码）"
+function Write-GhostScript([string]$name) {
+    $tpl = Get-Content -LiteralPath (Join-Path $RepoRoot ("tools\LlamaTreeExp\" + $name)) -Raw
+    $body = $tpl.Replace('@@GHOST_HOME@@', $RepoRoot)
+    $body = ($body -replace "`r`n", "`n") -replace "`n", "`r`n"   # 统一 CRLF，cmd 才能稳定解析
+    [IO.File]::WriteAllText((Join-Path $RimeDir $name), $body, [Text.Encoding]::GetEncoding(936))
+}
+foreach ($s in $Scripts) {
+    Step $s
+    if (-not $DryRun) {
+        Write-GhostScript $s
+        $inst = Join-Path $RimeDir $s
+        $txt = [IO.File]::ReadAllText($inst, [Text.Encoding]::GetEncoding(936))
+        if ($txt.Contains('@@GHOST_HOME@@')) { throw ("$s 里的 @@GHOST_HOME@@ 没被替换，安装中止") }
+        if (-not $txt.Contains($RepoRoot)) { throw ("$s 里的仓库路径不正确，安装中止") }
+    }
+}
+
+Say "5/6 写入 ghost_home.txt（仅作旧版脚本回退）"
 Step $RepoRoot
 if (-not $DryRun) {
-    [IO.File]::WriteAllText((Join-Path $RimeDir 'ghost_home.txt'), $RepoRoot + "`r`n",
-                            [Text.Encoding]::GetEncoding(936))
+    $homeFile = Join-Path $RimeDir 'ghost_home.txt'
+    [IO.File]::WriteAllText($homeFile, $RepoRoot + "`r`n", [Text.Encoding]::GetEncoding(936))
+    # 回读校验：这个文件曾经被 UTF-8 覆盖过，于是 set /p 按 ANSI 读出乱码，
+    # 面板静默起不来。装完必须按 ANSI 解出来等于 $RepoRoot 才算过。
+    $ansi = [Text.Encoding]::GetEncoding(936).GetString([IO.File]::ReadAllBytes($homeFile)).Trim()
+    if ($ansi -ne $RepoRoot) { throw ("ghost_home.txt 编码不对：按 ANSI 解出 '$ansi'，期望 '$RepoRoot'") }
+    Step "编码校验通过（ANSI 可正确读出）"
 }
 
 if (-not $SkipRegistry) {
